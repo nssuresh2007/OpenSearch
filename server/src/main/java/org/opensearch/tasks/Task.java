@@ -238,6 +238,16 @@ public class Task {
         return null;
     }
 
+    public Map<String, Long> getResourceStats() {
+        // TODO: Replace this with the actual method.
+        return new HashMap<String, Long>() {
+            {
+                put("cpu", id * 100);
+                put("memory", id * 100);
+            }
+        };
+    }
+
     /**
      * Returns thread level resource consumption of the task
      */
