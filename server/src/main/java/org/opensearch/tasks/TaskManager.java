@@ -99,7 +99,7 @@ public class TaskManager implements ClusterStateApplier {
      */
     private static final String TASK_RESOURCE_CONSUMERS_ATTRIBUTES = "cluster.task.consumers";
 
-    private static final Setting<Boolean> TASK_RESOURCE_CONSUMERS_SETTINGS = Setting.boolSetting(
+    private static final Setting<Boolean> TASK_RESOURCE_CONSUMERS_SETTING = Setting.boolSetting(
         TASK_RESOURCE_CONSUMERS_ATTRIBUTES,
         true,
         Setting.Property.Dynamic,
@@ -135,7 +135,7 @@ public class TaskManager implements ClusterStateApplier {
         this.threadPool = threadPool;
         this.taskHeaders = new ArrayList<>(taskHeaders);
         this.maxHeaderSize = SETTING_HTTP_MAX_HEADER_SIZE.get(settings);
-        this.taskResourceConsumersEnabled = TASK_RESOURCE_CONSUMERS_SETTINGS.get(settings);
+        this.taskResourceConsumersEnabled = TASK_RESOURCE_CONSUMERS_SETTING.get(settings);
         this.taskResourceConsumer = new ArrayList<Consumer<Task>>() {
             {
                 add(new TopNSearchTasksLogger(settings));

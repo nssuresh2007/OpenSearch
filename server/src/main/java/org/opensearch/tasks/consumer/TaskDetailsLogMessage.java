@@ -14,7 +14,6 @@ import org.opensearch.tasks.Task;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
 
 public final class TaskDetailsLogMessage extends OpenSearchLogMessage {
     TaskDetailsLogMessage(Task task) {
@@ -27,7 +26,7 @@ public final class TaskDetailsLogMessage extends OpenSearchLogMessage {
         messageFields.put("type", task.getType());
         messageFields.put("action", task.getAction());
         messageFields.put("description", task.getDescription());
-        messageFields.put("start_time_millis", TimeUnit.NANOSECONDS.toMillis(task.getStartTime()));
+        messageFields.put("start_time_millis", task.getStartTime());
         messageFields.put("parentTaskId", task.getParentTaskId());
         messageFields.put("resource_stats", task.getResourceStats());
         messageFields.put("metadata", task instanceof SearchShardTask ? ((SearchShardTask) task).getTaskMetadata() : null);
@@ -50,7 +49,7 @@ public final class TaskDetailsLogMessage extends OpenSearchLogMessage {
             .append(task.getDescription())
             .append("], ")
             .append("start_time_millis:[")
-            .append(TimeUnit.NANOSECONDS.toMillis(task.getStartTime()))
+            .append(task.getStartTime())
             .append("], ")
             .append("resource_stats:[")
             .append(task.getResourceStats())
