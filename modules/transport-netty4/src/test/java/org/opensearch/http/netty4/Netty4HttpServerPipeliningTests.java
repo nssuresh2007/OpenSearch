@@ -163,9 +163,12 @@ public class Netty4HttpServerPipeliningTests extends OpenSearchTestCase {
         @Override
         protected void initChannel(Channel ch) throws Exception {
             super.initChannel(ch);
-            ch.pipeline().replace("handler", "handler", new PossiblySlowUpstreamHandler(executorService));
         }
 
+        @Override
+        public ChannelHandler getRequestHandler() {
+            return new PossiblySlowUpstreamHandler(executorService);
+        }
     }
 
     class PossiblySlowUpstreamHandler extends SimpleChannelInboundHandler<HttpPipelinedRequest> {
