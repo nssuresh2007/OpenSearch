@@ -397,7 +397,6 @@ public class ClusterModule extends AbstractModule {
         bind(NodeMappingRefreshAction.class).asEagerSingleton();
         bind(MappingUpdatedAction.class).asEagerSingleton();
         bind(TaskResultsService.class).asEagerSingleton();
-        bind(TaskResourceTrackingService.class).asEagerSingleton();
         bind(AllocationDeciders.class).toInstance(allocationDeciders);
         bind(ShardsAllocator.class).toInstance(shardsAllocator);
     }

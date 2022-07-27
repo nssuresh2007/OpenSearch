@@ -15,6 +15,9 @@ import org.opensearch.tasks.Task;
 import java.util.HashMap;
 import java.util.Map;
 
+/**
+ * Task details logs message
+ */
 public final class TaskDetailsLogMessage extends OpenSearchLogMessage {
     TaskDetailsLogMessage(Task task) {
         super(prepareMap(task), message(task));

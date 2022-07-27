@@ -141,6 +141,7 @@ public class QueryPhase {
             return;
         }
 
+        LOGGER.info("Query: {}, TaskId: {}", new SearchContextSourcePrinter(searchContext), searchContext.getTask().getId());
         if (LOGGER.isTraceEnabled()) {
             LOGGER.trace("{}", new SearchContextSourcePrinter(searchContext));
         }

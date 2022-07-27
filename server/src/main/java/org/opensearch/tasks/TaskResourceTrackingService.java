@@ -12,11 +12,13 @@ import com.sun.management.ThreadMXBean;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.logging.log4j.message.ParameterizedMessage;
+import org.opensearch.action.search.SearchTransportService;
 import org.opensearch.common.SuppressForbidden;
 import org.opensearch.common.inject.Inject;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.concurrent.ConcurrentCollections;
 import org.opensearch.common.util.concurrent.ConcurrentMapLong;
 import org.opensearch.common.util.concurrent.ThreadContext;
@@ -24,10 +26,10 @@ import org.opensearch.threadpool.RunnableTaskExecutionListener;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.lang.management.ManagementFactory;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors;
 
 import static org.opensearch.tasks.ResourceStatsType.WORKER_STATS;
 
@@ -52,12 +54,16 @@ public class TaskResourceTrackingService implements RunnableTaskExecutionListene
     private final ConcurrentMapLong<Task> resourceAwareTasks = ConcurrentCollections.newConcurrentMapLongWithAggressiveConcurrency();
     private final ThreadPool threadPool;
     private volatile boolean taskResourceTrackingEnabled;
+    private final int MOVING_WINDOW_SIZE = 100;
+    private final ConcurrentLinkedQueue<Double> resourceConsumptionMovingQueue = new ConcurrentLinkedQueue<>();
+    private final TaskResourceConsumptionObserver taskResourceConsumptionObserver = new TaskResourceConsumptionObserver(this);
 
     @Inject
     public TaskResourceTrackingService(Settings settings, ClusterSettings clusterSettings, ThreadPool threadPool) {
         this.taskResourceTrackingEnabled = TASK_RESOURCE_TRACKING_ENABLED.get(settings);
         this.threadPool = threadPool;
         clusterSettings.addSettingsUpdateConsumer(TASK_RESOURCE_TRACKING_ENABLED, this::setTaskResourceTrackingEnabled);
+        threadPool.scheduleWithFixedDelay(taskResourceConsumptionObserver, TimeValue.timeValueSeconds(1), ThreadPool.Names.SAME);
     }
 
     public void setTaskResourceTrackingEnabled(boolean taskResourceTrackingEnabled) {
@@ -116,12 +122,39 @@ public class TaskResourceTrackingService implements RunnableTaskExecutionListene
                 logger.warn("No thread should be active when task finishes. Active threads: {}", threadsWorkingOnTask);
                 assert false : "No thread should be marked active when task finishes";
             }
+            updateMovingAverage(task);
+            taskResourceConsumptionObserver.signalTaskCompleted(task.getId());
         } catch (Exception e) {
             logger.warn("Failed while trying to mark the task execution on current thread completed.", e);
             assert false;
         } finally {
             resourceAwareTasks.remove(task.getId());
         }
+    }
+
+    private void updateMovingAverage(Task task) {
+        if (!task.getAction().equals(SearchTransportService.QUERY_ACTION_NAME)) {
+            return;
+        }
+        double currentVal = task.getTotalResourceUtilization(ResourceStats.MEMORY);
+        if (resourceConsumptionMovingQueue.size() > MOVING_WINDOW_SIZE) {
+            resourceConsumptionMovingQueue.poll();
+        }
+        resourceConsumptionMovingQueue.offer(currentVal);
+    }
+
+    public double getCompletedTaskResourceConsumptionAvg() {
+        double sum = 0;
+        double count = 0;
+        if (resourceConsumptionMovingQueue.size() < MOVING_WINDOW_SIZE) {
+            logger.info("Moving queue size not reached: {}", resourceConsumptionMovingQueue.size());
+            return 0;
+        }
+        for (double consumptionVal : resourceConsumptionMovingQueue) {
+            sum += consumptionVal;
+            count++;
+        }
+        return sum/count;
     }
 
     /**
@@ -134,7 +167,6 @@ public class TaskResourceTrackingService implements RunnableTaskExecutionListene
         if (isTaskResourceTrackingEnabled() == false || isTaskResourceTrackingSupported() == false) {
             return;
         }
-
         for (Task task : tasks) {
             if (task.supportsResourceTracking() && resourceAwareTasks.containsKey(task.getId())) {
                 refreshResourceStats(task);
@@ -144,7 +176,6 @@ public class TaskResourceTrackingService implements RunnableTaskExecutionListene
 
     private void refreshResourceStats(Task resourceAwareTask) {
         try {
-            logger.debug("Refreshing resource stats for Task: {}", resourceAwareTask.getId());
             List<Long> threadsWorkingOnTask = getThreadsWorkingOnTask(resourceAwareTask);
             threadsWorkingOnTask.forEach(
                 threadId -> resourceAwareTask.updateThreadResourceStats(threadId, WORKER_STATS, getResourceUsageMetricsForThread(threadId))
@@ -250,6 +281,37 @@ public class TaskResourceTrackingService implements RunnableTaskExecutionListene
         ThreadContext.StoredContext storedContext = threadContext.newStoredContext(true, Collections.singletonList(TASK_ID));
         threadContext.putTransient(TASK_ID, task.getId());
         return storedContext;
+    }
+
+    private static class TaskResourceConsumption {
+        private final long taskId;
+        private final long memConsumed;
+
+        public TaskResourceConsumption(long taskId, long memConsumed) {
+            this.taskId = taskId;
+            this.memConsumed = memConsumed;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            TaskResourceConsumption that = (TaskResourceConsumption) o;
+            return taskId == that.taskId && memConsumed == that.memConsumed;
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(taskId, memConsumed);
+        }
+
+        @Override
+        public String toString() {
+            return "TaskResourceConsumption{" +
+                "taskId=" + taskId +
+                ", memConsumed=" + memConsumed +
+                '}';
+        }
     }
 
 }

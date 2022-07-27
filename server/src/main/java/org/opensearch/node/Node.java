@@ -757,6 +757,11 @@ public class Node implements Closeable {
                 transportService,
                 SearchExecutionStatsCollector.makeWrapper(responseCollectorService)
             );
+            final TaskResourceTrackingService taskResourceTrackingService = new TaskResourceTrackingService(
+                settings,
+                settingsModule.getClusterSettings(),
+                threadPool
+            );
             final HttpServerTransport httpServerTransport = newHttpTransport(networkModule);
             final IndexingPressureService indexingPressureService = new IndexingPressureService(settings, clusterService);
             // Going forward, IndexingPressureService will have required constructs for exposing listeners/interfaces for plugin
@@ -863,7 +868,8 @@ public class Node implements Closeable {
                 searchModule.getFetchPhase(),
                 responseCollectorService,
                 circuitBreakerService,
-                searchModule.getIndexSearcherExecutor(threadPool)
+                searchModule.getIndexSearcherExecutor(threadPool),
+                taskResourceTrackingService
             );
 
             final List<PersistentTasksExecutor<?>> tasksExecutors = pluginsService.filterPlugins(PersistentTaskPlugin.class)
@@ -952,6 +958,7 @@ public class Node implements Closeable {
                 b.bind(ShardLimitValidator.class).toInstance(shardLimitValidator);
                 b.bind(FsHealthService.class).toInstance(fsHealthService);
                 b.bind(SystemIndices.class).toInstance(systemIndices);
+                b.bind(TaskResourceTrackingService.class).toInstance(taskResourceTrackingService);
             });
             injector = modules.createInjector();
 
@@ -1428,7 +1435,8 @@ public class Node implements Closeable {
         FetchPhase fetchPhase,
         ResponseCollectorService responseCollectorService,
         CircuitBreakerService circuitBreakerService,
-        Executor indexSearcherExecutor
+        Executor indexSearcherExecutor,
+        TaskResourceTrackingService taskResourceTrackingService
     ) {
         return new SearchService(
             clusterService,

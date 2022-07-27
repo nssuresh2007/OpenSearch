@@ -43,6 +43,8 @@ import org.opensearch.search.internal.AliasFilter;
 import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.internal.ShardSearchRequest;
 import org.opensearch.search.query.QuerySearchResult;
+import org.opensearch.tasks.Task;
+import org.opensearch.tasks.TaskResourceTrackingService;
 import org.opensearch.transport.Transport;
 
 import java.util.Map;

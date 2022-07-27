@@ -299,6 +299,7 @@ import org.opensearch.search.suggest.phrase.SmoothingModel;
 import org.opensearch.search.suggest.phrase.StupidBackoff;
 import org.opensearch.search.suggest.term.TermSuggestion;
 import org.opensearch.search.suggest.term.TermSuggestionBuilder;
+import org.opensearch.tasks.TaskResourceTrackingService;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.util.ArrayList;

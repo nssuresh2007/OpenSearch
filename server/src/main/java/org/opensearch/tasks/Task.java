@@ -32,6 +32,8 @@
 
 package org.opensearch.tasks;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionResponse;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.common.io.stream.NamedWriteable;
@@ -236,16 +238,6 @@ public class Task {
      */
     public Status getStatus() {
         return null;
-    }
-
-    public Map<String, Long> getResourceStats() {
-        // TODO: Replace this with the actual method.
-        return new HashMap<String, Long>() {
-            {
-                put("cpu", id * 100);
-                put("memory", id * 100);
-            }
-        };
     }
 
     /**
