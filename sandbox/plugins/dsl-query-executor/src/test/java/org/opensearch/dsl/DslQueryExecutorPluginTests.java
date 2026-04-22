@@ -48,8 +48,9 @@ public class DslQueryExecutorPluginTests extends OpenSearchTestCase {
         var actions = plugin.getActions();
 
         assertEquals(1, actions.size());
-        ActionPlugin.ActionHandler<?, ?> handler = actions.get(0);
-        assertEquals(DslExecuteAction.INSTANCE, handler.getAction());
-        assertEquals(TransportDslExecuteAction.class, handler.getTransportAction());
+
+        ActionPlugin.ActionHandler<?, ?> searchHandler = actions.get(0);
+        assertEquals(DslExecuteAction.INSTANCE, searchHandler.getAction());
+        assertEquals(TransportDslExecuteAction.class, searchHandler.getTransportAction());
     }
 }

@@ -35,8 +35,12 @@ import java.util.List;
 import java.util.function.Supplier;
 
 /**
- * Plugin entry point. Registers {@link SearchActionFilter} to intercept _search requests
- * and {@link TransportDslExecuteAction} to handle DSL-to-Calcite conversion and execution.
+ * Plugin entry point. Registers {@link SearchActionFilter} to intercept {@code _search}
+ * requests and {@link TransportDslExecuteAction} to handle DSL-to-Calcite conversion and execution.
+ *
+ * <p>Search templates ({@code _search/template}), multi-search ({@code _msearch}), and
+ * multi-search-template ({@code _msearch/template}) all work automatically because the native
+ * transport actions call {@code client.search()} internally, which is intercepted by the filter.
  */
 public class DslQueryExecutorPlugin extends Plugin implements ActionPlugin {
 

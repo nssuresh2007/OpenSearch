@@ -37,6 +37,7 @@ dependencies {
 
   testImplementation project(':test:framework')
   testImplementation "org.mockito:mockito-core:${versions.mockito}"
+  testImplementation 'net.jqwik:jqwik:1.9.1'
 
   internalClusterTestImplementation project(':server')
   internalClusterTestImplementation project(':test:framework')

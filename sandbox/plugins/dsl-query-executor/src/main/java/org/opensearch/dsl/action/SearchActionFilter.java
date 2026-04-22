@@ -20,9 +20,30 @@ import org.opensearch.core.action.ActionResponse;
 import org.opensearch.tasks.Task;
 import org.opensearch.transport.client.node.NodeClient;
 
+import java.util.Map;
+
 /**
- * Intercepts all {@code _search} requests and dispatches them to {@link DslExecuteAction}
- * for execution through the Calcite pipeline. Non-search actions pass through unchanged.
+ * Intercepts search-related transport actions and dispatches them to DSL handlers
+ * for execution through the Calcite pipeline.
+ *
+ * <p>Supported actions (dispatch map entries):
+ * <ul>
+ *   <li>{@code _search} ({@link SearchAction#NAME}) &rarr; {@link DslExecuteAction}</li>
+ * </ul>
+ *
+ * <p>The following APIs are <b>not</b> intercepted because the native transport actions
+ * call {@code client.search()} internally, which triggers {@link SearchAction#NAME}
+ * and is intercepted by this filter automatically:
+ * <ul>
+ *   <li>{@code _search/template} &mdash; {@code TransportSearchTemplateAction} renders the
+ *       Mustache template then calls {@code client.search()}</li>
+ *   <li>{@code _msearch} &mdash; {@code TransportMultiSearchAction} calls {@code client.search()} per sub-request</li>
+ *   <li>{@code _msearch/template} &mdash; {@code TransportMultiSearchTemplateAction} renders templates,
+ *       then calls {@code client.multiSearch()} which chains through {@code _msearch} &rarr;
+ *       {@code client.search()} per sub-request</li>
+ * </ul>
+ *
+ * <p>Non-matching actions pass through the filter chain unchanged.
  */
 public class SearchActionFilter implements ActionFilter {
 
@@ -30,14 +51,24 @@ public class SearchActionFilter implements ActionFilter {
     static final int FILTER_ORDER = 1;
 
     private final NodeClient client;
+    private final Map<String, ActionDispatcher> dispatchers;
 
     /**
-     * Creates a filter that dispatches intercepted searches via the given client.
+     * Dispatches an intercepted request to the appropriate DSL transport action.
+     */
+    @FunctionalInterface
+    interface ActionDispatcher {
+        void dispatch(Task task, ActionRequest request, ActionListener<?> listener);
+    }
+
+    /**
+     * Creates a filter that dispatches intercepted search actions via the given client.
      *
-     * @param client node client for dispatching to {@link DslExecuteAction}
+     * @param client node client for dispatching to DSL transport actions
      */
     public SearchActionFilter(NodeClient client) {
         this.client = client;
+        this.dispatchers = Map.of(SearchAction.NAME, (task, req, listener) -> dispatchSearch(req, listener));
     }
 
     @Override
@@ -55,13 +86,17 @@ public class SearchActionFilter implements ActionFilter {
         ActionListener<Response> listener,
         ActionFilterChain<Request, Response> chain
     ) {
-        // TODO: add support for other search-related APIs (_msearch, _count, _search_shards, etc.).
-        // Consider two categories: APIs that execute search vs APIs that only explain/validate.
-        if (SearchAction.NAME.equals(action)) {
-            SearchRequest searchRequest = (SearchRequest) request;
-            client.execute(DslExecuteAction.INSTANCE, searchRequest, (ActionListener<SearchResponse>) listener);
+        ActionDispatcher dispatcher = dispatchers.get(action);
+        if (dispatcher != null) {
+            dispatcher.dispatch(task, request, listener);
         } else {
             chain.proceed(task, action, request, listener);
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void dispatchSearch(ActionRequest request, ActionListener<?> listener) {
+        SearchRequest searchRequest = (SearchRequest) request;
+        client.execute(DslExecuteAction.INSTANCE, searchRequest, (ActionListener<SearchResponse>) listener);
     }
 }
