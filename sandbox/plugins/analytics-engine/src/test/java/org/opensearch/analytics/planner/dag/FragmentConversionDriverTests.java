@@ -299,6 +299,7 @@ public class FragmentConversionDriverTests extends BasePlannerRulesTests {
                 map.put(ScalarFunction.MATCH, serializer);
                 map.put(ScalarFunction.WILDCARD, serializer);
                 map.put(ScalarFunction.REGEXP, serializer);
+                map.put(ScalarFunction.EQUALS, serializer);
                 return map;
             }
         };
@@ -428,18 +429,18 @@ public class FragmentConversionDriverTests extends BasePlannerRulesTests {
         assertDelegationResult(plan, dfConvertor, serializer, 1, true, false, List.of("MATCH_PHRASE"), FilterTreeShape.CONJUNCTIVE);
     }
 
-    /** Single native equals — no delegation, empty delegatedQueries. */
+    /** Single equals — delegated to Lucene via TermQuery. */
     public void testSingleNativePredicate() {
         RecordingConvertor dfConvertor = new RecordingConvertor();
         RecordingSerializer serializer = new RecordingSerializer();
         QueryDAG dag = buildTwoFieldDelegationDag(makeEquals(0, SqlTypeName.INTEGER, 200), dfConvertor, serializer);
         StagePlan plan = leafStage(dag).getPlanAlternatives().getFirst();
-        assertDelegationResult(plan, dfConvertor, serializer, 0, false, true, List.of(), FilterTreeShape.NO_DELEGATION);
+        assertDelegationResult(plan, dfConvertor, serializer, 1, true, false, List.of("="), FilterTreeShape.CONJUNCTIVE);
     }
 
     // ---- AND conditions ----
 
-    /** AND(native, delegated) — equals unwrapped, MATCH_PHRASE replaced. */
+    /** AND(delegated equals, delegated MATCH_PHRASE) — both delegated to Lucene. */
     public void testAndNativeAndDelegated() {
         RecordingConvertor dfConvertor = new RecordingConvertor();
         RecordingSerializer serializer = new RecordingSerializer();
@@ -449,7 +450,7 @@ public class FragmentConversionDriverTests extends BasePlannerRulesTests {
             serializer
         );
         StagePlan plan = leafStage(dag).getPlanAlternatives().getFirst();
-        assertDelegationResult(plan, dfConvertor, serializer, 1, true, true, List.of("MATCH_PHRASE"), FilterTreeShape.CONJUNCTIVE);
+        assertDelegationResult(plan, dfConvertor, serializer, 2, true, false, List.of("=", "MATCH_PHRASE"), FilterTreeShape.CONJUNCTIVE);
     }
 
     /** AND(delegated, delegated) — both replaced, two entries in delegatedQueries. */
@@ -476,7 +477,7 @@ public class FragmentConversionDriverTests extends BasePlannerRulesTests {
 
     // ---- OR conditions ----
 
-    /** OR(native, delegated) — structure preserved, delegated replaced. */
+    /** OR(delegated equals, delegated MATCH_PHRASE) — both delegated, structure preserved. */
     public void testOrNativeAndDelegated() {
         RecordingConvertor dfConvertor = new RecordingConvertor();
         RecordingSerializer serializer = new RecordingSerializer();
@@ -490,22 +491,12 @@ public class FragmentConversionDriverTests extends BasePlannerRulesTests {
             serializer
         );
         StagePlan plan = leafStage(dag).getPlanAlternatives().getFirst();
-        assertDelegationResult(
-            plan,
-            dfConvertor,
-            serializer,
-            1,
-            true,
-            true,
-            List.of("MATCH_PHRASE"),
-            FilterTreeShape.INTERLEAVED_BOOLEAN_EXPRESSION
-        );
-        assertTrue("OR structure should be preserved", RelOptUtil.toString(dfConvertor.shardScanFragment).contains("OR"));
+        assertDelegationResult(plan, dfConvertor, serializer, 2, true, false, List.of("=", "MATCH_PHRASE"), FilterTreeShape.CONJUNCTIVE);
     }
 
     // ---- Interleaved AND/OR/NOT ----
 
-    /** AND(native, OR(delegated, NOT(delegated))) — nested boolean structure with delegation. */
+    /** AND(delegated equals, OR(delegated MATCH_PHRASE, NOT(delegated FUZZY))) — nested boolean structure with delegation. */
     public void testInterleavedAndOrNot() {
         RecordingConvertor dfConvertor = new RecordingConvertor();
         RecordingSerializer serializer = new RecordingSerializer();
@@ -521,7 +512,16 @@ public class FragmentConversionDriverTests extends BasePlannerRulesTests {
         RexNode condition = makeAnd(makeEquals(0, SqlTypeName.INTEGER, 200), orClause);
         QueryDAG dag = buildTwoFieldDelegationDag(condition, dfConvertor, serializer);
         StagePlan plan = leafStage(dag).getPlanAlternatives().getFirst();
-        assertDelegationResult(plan, dfConvertor, serializer, 2, true, true, List.of("MATCH_PHRASE", "FUZZY"), FilterTreeShape.CONJUNCTIVE);
+        assertDelegationResult(
+            plan,
+            dfConvertor,
+            serializer,
+            3,
+            true,
+            false,
+            List.of("=", "MATCH_PHRASE", "FUZZY"),
+            FilterTreeShape.CONJUNCTIVE
+        );
         String strippedPlan = RelOptUtil.toString(dfConvertor.shardScanFragment);
         assertTrue("AND structure should be preserved", strippedPlan.contains("AND"));
         assertTrue("OR structure should be preserved", strippedPlan.contains("OR"));

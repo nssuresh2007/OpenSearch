@@ -12,7 +12,6 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
-import org.apache.calcite.sql.SqlFunction;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.planner.CapabilityRegistry;
@@ -171,10 +170,15 @@ public class FragmentConversionDriver {
                     return annotation.unwrap();
                 }
                 RexNode original = annotation.unwrap();
-                if (!(original instanceof RexCall originalCall) || !(originalCall.getOperator() instanceof SqlFunction sqlFunction)) {
-                    throw new IllegalStateException("Delegated expression must be a SqlFunction call: " + original);
+                if (!(original instanceof RexCall originalCall)) {
+                    throw new IllegalStateException("Delegated expression must be a RexCall: " + original);
                 }
-                ScalarFunction function = ScalarFunction.fromSqlFunction(sqlFunction);
+                ScalarFunction function = ScalarFunction.fromSqlOperatorWithFallback(originalCall.getOperator());
+                if (function == null) {
+                    throw new IllegalStateException(
+                        "Delegated expression has unrecognized operator: " + originalCall.getOperator().getName()
+                    );
+                }
                 DelegatedPredicateSerializer serializer = registry.getBackend(annotationBackend)
                     .getCapabilityProvider()
                     .delegatedPredicateSerializers()

@@ -9,12 +9,20 @@
 package org.opensearch.analytics.planner.dag;
 
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.rex.RexNode;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.planner.CapabilityRegistry;
+import org.opensearch.analytics.planner.rel.AnnotatedPredicate;
 import org.opensearch.analytics.planner.rel.OpenSearchRelNode;
 import org.opensearch.analytics.planner.rel.OperatorAnnotation;
+import org.opensearch.analytics.spi.DelegationType;
+import org.opensearch.analytics.spi.ScalarFunction;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Generates plan alternatives for each {@link Stage} in a {@link QueryDAG}.
@@ -33,6 +41,19 @@ import java.util.List;
  * @opensearch.internal
  */
 public class PlanForker {
+
+    private static final Logger logger = LogManager.getLogger(PlanForker.class);
+
+    /**
+     * Functions for which we prefer delegating to a specialized backend (e.g. Lucene inverted index)
+     * over native evaluation on the operator backend (e.g. DataFusion row-scan).
+     * Currently EQUALS (TermQuery) and IN (TermsQuery) because the Lucene backend uses only the inverted index.
+     */
+    private static final Set<ScalarFunction> DELEGATION_PREFERRED_FUNCTIONS = Set.of(
+        ScalarFunction.EQUALS,
+        ScalarFunction.IN,
+        ScalarFunction.SARG_PREDICATE
+    );
 
     private PlanForker() {}
 
@@ -62,13 +83,13 @@ public class PlanForker {
         }
 
         if (childAlternativeSets.isEmpty()) {
-            return resolveOperator(node, List.of(), null);
+            return resolveOperator(node, List.of(), null, registry);
         }
 
         if (childAlternativeSets.size() == 1) {
             List<Resolved> results = new ArrayList<>();
             for (Resolved childAlt : childAlternativeSets.getFirst()) {
-                results.addAll(resolveOperator(node, List.of(childAlt.node), childAlt.chosenBackend));
+                results.addAll(resolveOperator(node, List.of(childAlt.node), childAlt.chosenBackend, registry));
             }
             return results;
         }
@@ -105,10 +126,10 @@ public class PlanForker {
                     );
                 }
         }
-        return resolveOperator(node, resolvedChildren, agreedBackend);
+        return resolveOperator(node, resolvedChildren, agreedBackend, registry);
     }
 
-    private static List<Resolved> resolveOperator(RelNode node, List<RelNode> children, String childBackend) {
+    private static List<Resolved> resolveOperator(RelNode node, List<RelNode> children, String childBackend, CapabilityRegistry registry) {
         if (!(node instanceof OpenSearchRelNode openSearchNode)) {
             // Non-OpenSearch node (e.g. StageInputScan infrastructure) — pass through.
             RelNode result = children.isEmpty() ? node : node.copy(node.getTraitSet(), children);
@@ -135,7 +156,7 @@ public class PlanForker {
             }
             // Group annotations by target backend — one plan per distinct annotation backend group.
             // With a single backend, this produces exactly one alternative naturally.
-            results.addAll(resolveWithBranching(openSearchNode, backend, children, annotations));
+            results.addAll(resolveWithBranching(openSearchNode, backend, children, annotations, registry));
         }
         return results;
     }
@@ -144,32 +165,91 @@ public class PlanForker {
         OpenSearchRelNode node,
         String backend,
         List<RelNode> children,
-        List<OperatorAnnotation> annotations
+        List<OperatorAnnotation> annotations,
+        CapabilityRegistry registry
     ) {
-        // TODO: delegation will change this — when annotations have viable backends that differ
-        // from the operator's backend, generate one plan per distinct annotation target backend
-        // (e.g. DF operator with Lucene annotation for filter delegation).
-        // For PR2 (no delegation), always resolve annotations to the operator's own backend.
-        List<OperatorAnnotation> resolved = resolveAnnotationsToTarget(annotations, backend, backend);
+        List<OperatorAnnotation> resolved = resolveAnnotationsToTarget(annotations, backend, backend, registry);
         return List.of(new Resolved(backend, node.copyResolved(backend, children, resolved)));
     }
 
     private static List<OperatorAnnotation> resolveAnnotationsToTarget(
         List<OperatorAnnotation> annotations,
         String targetBackend,
-        String operatorBackend
+        String operatorBackend,
+        CapabilityRegistry registry
     ) {
         List<OperatorAnnotation> resolved = new ArrayList<>();
         for (OperatorAnnotation annotation : annotations) {
-            if (annotation.getViableBackends().contains(targetBackend)) {
+            // Prefer delegation target only for specific functions (EQUALS → TermQuery)
+            String delegationTarget = findDelegationTarget(annotation, operatorBackend, registry);
+            if (delegationTarget != null) {
+                logger.info(
+                    "Annotation [{}] delegated to [{}] (function in DELEGATION_PREFERRED_FUNCTIONS, operator backend=[{}])",
+                    annotation,
+                    delegationTarget,
+                    operatorBackend
+                );
+                resolved.add(annotation.narrowTo(delegationTarget));
+            } else if (annotation.getViableBackends().contains(targetBackend)) {
+                logger.info("Annotation [{}] narrowed to target backend [{}]", annotation, targetBackend);
                 resolved.add(annotation.narrowTo(targetBackend));
             } else if (annotation.getViableBackends().contains(operatorBackend)) {
+                logger.info("Annotation [{}] narrowed to operator backend [{}]", annotation, operatorBackend);
                 resolved.add(annotation.narrowTo(operatorBackend));
             } else {
                 // Fallback: narrow to first viable backend.
-                resolved.add(annotation.narrowTo(annotation.getViableBackends().getFirst()));
+                String fallback = annotation.getViableBackends().getFirst();
+                logger.info("Annotation [{}] narrowed to fallback backend [{}]", annotation, fallback);
+                resolved.add(annotation.narrowTo(fallback));
             }
         }
         return resolved;
+    }
+
+    /**
+     * Finds a delegation target for this annotation, but only if the annotation's
+     * predicate function is in the delegation-preferred set (e.g. EQUALS → TermQuery).
+     * Returns null if the function is not delegation-preferred or no suitable target exists.
+     */
+    private static String findDelegationTarget(OperatorAnnotation annotation, String operatorBackend, CapabilityRegistry registry) {
+        ScalarFunction function = extractFunction(annotation);
+        if (function == null || DELEGATION_PREFERRED_FUNCTIONS.contains(function) == false) {
+            logger.info(
+                "findDelegationTarget: function=[{}] not in preferred set, skipping delegation for annotation [{}]",
+                function,
+                annotation
+            );
+            return null;
+        }
+        List<String> acceptors = registry.delegationAcceptors(DelegationType.FILTER);
+        logger.info(
+            "findDelegationTarget: function=[{}] is delegation-preferred, viable=[{}], acceptors=[{}], operatorBackend=[{}]",
+            function,
+            annotation.getViableBackends(),
+            acceptors,
+            operatorBackend
+        );
+        for (String backend : annotation.getViableBackends()) {
+            if (backend.equals(operatorBackend) == false && acceptors.contains(backend)) {
+                logger.info("findDelegationTarget: selected delegation target [{}] for function [{}]", backend, function);
+                return backend;
+            }
+        }
+        logger.info("findDelegationTarget: no delegation target found for function [{}], falling back to native eval", function);
+        return null;
+    }
+
+    /**
+     * Extracts the ScalarFunction from an annotation's underlying RexCall.
+     * Returns null if the annotation is not a predicate or cannot be resolved.
+     */
+    private static ScalarFunction extractFunction(OperatorAnnotation annotation) {
+        if (annotation instanceof AnnotatedPredicate predicate) {
+            RexNode original = predicate.getOriginal();
+            if (original instanceof RexCall call) {
+                return ScalarFunction.fromSqlOperatorWithFallback(call.getOperator());
+            }
+        }
+        return null;
     }
 }

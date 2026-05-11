@@ -66,7 +66,7 @@ public class BackendPlanAdapter {
                 adapted.add(plan);
             } else {
                 LOGGER.debug("Before adaptation [{}]:\n{}", plan.backendId(), RelOptUtil.toString(plan.resolvedFragment()));
-                RelNode adaptedFragment = adaptNode(plan.resolvedFragment(), adapters);
+                RelNode adaptedFragment = adaptNode(plan.resolvedFragment(), adapters, plan.backendId());
                 LOGGER.debug("After adaptation [{}]:\n{}", plan.backendId(), RelOptUtil.toString(adaptedFragment));
                 adapted.add(new StagePlan(adaptedFragment, plan.backendId()));
             }
@@ -74,20 +74,20 @@ public class BackendPlanAdapter {
         stage.setPlanAlternatives(adapted);
     }
 
-    private static RelNode adaptNode(RelNode node, Map<ScalarFunction, ScalarFunctionAdapter> adapters) {
+    private static RelNode adaptNode(RelNode node, Map<ScalarFunction, ScalarFunctionAdapter> adapters, String planBackendId) {
         List<RelNode> adaptedChildren = new ArrayList<>(node.getInputs().size());
         boolean childrenChanged = false;
         for (RelNode child : node.getInputs()) {
-            RelNode adaptedChild = adaptNode(child, adapters);
+            RelNode adaptedChild = adaptNode(child, adapters, planBackendId);
             adaptedChildren.add(adaptedChild);
             if (adaptedChild != child) childrenChanged = true;
         }
 
         if (node instanceof OpenSearchFilter filter) {
-            return adaptFilter(filter, adapters, adaptedChildren, childrenChanged);
+            return adaptFilter(filter, adapters, adaptedChildren, childrenChanged, planBackendId);
         }
         if (node instanceof OpenSearchProject project) {
-            return adaptProject(project, adapters, adaptedChildren, childrenChanged);
+            return adaptProject(project, adapters, adaptedChildren, childrenChanged, planBackendId);
         }
 
         return childrenChanged ? node.copy(node.getTraitSet(), adaptedChildren) : node;
@@ -97,10 +97,11 @@ public class BackendPlanAdapter {
         OpenSearchFilter filter,
         Map<ScalarFunction, ScalarFunctionAdapter> adapters,
         List<RelNode> adaptedChildren,
-        boolean childrenChanged
+        boolean childrenChanged,
+        String planBackendId
     ) {
         List<FieldStorageInfo> fieldStorage = filter.getOutputFieldStorage();
-        RexNode adaptedCondition = adaptRex(filter.getCondition(), adapters, fieldStorage, filter.getCluster());
+        RexNode adaptedCondition = adaptRex(filter.getCondition(), adapters, fieldStorage, filter.getCluster(), planBackendId);
         if (adaptedCondition != filter.getCondition() || childrenChanged) {
             return new OpenSearchFilter(
                 filter.getCluster(),
@@ -117,7 +118,8 @@ public class BackendPlanAdapter {
         OpenSearchProject project,
         Map<ScalarFunction, ScalarFunctionAdapter> adapters,
         List<RelNode> adaptedChildren,
-        boolean childrenChanged
+        boolean childrenChanged,
+        String planBackendId
     ) {
         // RexInputRef in project expressions references the input's row type
         OpenSearchRelNode inputNode = (OpenSearchRelNode) RelNodeUtils.unwrapHep(project.getInput());
@@ -125,7 +127,7 @@ public class BackendPlanAdapter {
         List<RexNode> adaptedProjects = new ArrayList<>(project.getProjects().size());
         boolean projectsChanged = false;
         for (RexNode projectExpr : project.getProjects()) {
-            RexNode adapted = adaptRex(projectExpr, adapters, fieldStorage, project.getCluster());
+            RexNode adapted = adaptRex(projectExpr, adapters, fieldStorage, project.getCluster(), planBackendId);
             adaptedProjects.add(adapted);
             if (adapted != projectExpr) projectsChanged = true;
         }
@@ -158,7 +160,8 @@ public class BackendPlanAdapter {
         RexNode node,
         Map<ScalarFunction, ScalarFunctionAdapter> adapters,
         List<FieldStorageInfo> fieldStorage,
-        RelOptCluster cluster
+        RelOptCluster cluster,
+        String planBackendId
     ) {
         if (!(node instanceof RexCall call)) {
             return node;
@@ -166,8 +169,14 @@ public class BackendPlanAdapter {
 
         // Annotation wrappers: adapt the inner expression and re-wrap with same metadata.
         // Plain RexCall.clone() would drop the annotation subclass, breaking later stripping.
+        // Skip adaptation for delegated annotations — their backend differs from the plan's
+        // driving backend, and the delegation target's serializer expects the raw (unadapted) form.
         if (node instanceof OperatorAnnotation annotation && annotation.unwrap() != null) {
-            RexNode adaptedInner = adaptRex(annotation.unwrap(), adapters, fieldStorage, cluster);
+            if (annotation.getViableBackends().size() == 1 && annotation.getViableBackends().getFirst().equals(planBackendId) == false) {
+                // Delegated annotation: target backend differs from plan backend — don't adapt.
+                return node;
+            }
+            RexNode adaptedInner = adaptRex(annotation.unwrap(), adapters, fieldStorage, cluster, planBackendId);
             return adaptedInner == annotation.unwrap() ? node : annotation.withAdaptedOriginal(adaptedInner);
         }
 
@@ -175,7 +184,7 @@ public class BackendPlanAdapter {
         List<RexNode> adaptedOperands = new ArrayList<>(call.getOperands().size());
         boolean operandsChanged = false;
         for (RexNode operand : call.getOperands()) {
-            RexNode adapted = adaptRex(operand, adapters, fieldStorage, cluster);
+            RexNode adapted = adaptRex(operand, adapters, fieldStorage, cluster, planBackendId);
             adaptedOperands.add(adapted);
             if (adapted != operand) operandsChanged = true;
         }

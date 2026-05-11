@@ -13,20 +13,31 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.logical.LogicalFilter;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.SqlFunction;
+import org.apache.calcite.sql.SqlFunctionCategory;
+import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.apache.calcite.sql.type.OperandTypes;
+import org.apache.calcite.sql.type.ReturnTypes;
 import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.planner.BasePlannerRulesTests;
+import org.opensearch.analytics.planner.MockDataFusionBackend;
 import org.opensearch.analytics.planner.MockLuceneBackend;
+import org.opensearch.analytics.planner.PlannerContext;
 import org.opensearch.analytics.planner.rel.OpenSearchAggregate;
 import org.opensearch.analytics.planner.rel.OpenSearchFilter;
 import org.opensearch.analytics.planner.rel.OpenSearchRelNode;
 import org.opensearch.analytics.planner.rel.OpenSearchSort;
 import org.opensearch.analytics.planner.rel.OpenSearchTableScan;
+import org.opensearch.analytics.planner.rel.OperatorAnnotation;
 import org.opensearch.analytics.spi.AggregateCapability;
 import org.opensearch.analytics.spi.AggregateFunction;
+import org.opensearch.analytics.spi.AnalyticsSearchBackendPlugin;
+import org.opensearch.analytics.spi.DelegationType;
 import org.opensearch.analytics.spi.EngineCapability;
+import org.opensearch.analytics.spi.FieldStorageInfo;
 import org.opensearch.analytics.spi.FieldType;
 import org.opensearch.analytics.spi.ScanCapability;
 
@@ -266,5 +277,352 @@ public class PlanForkerTests extends BasePlannerRulesTests {
         // ReduceExpressionsRule folds 1=1 → TRUE, then filter on TRUE is removed
         assertFalse("filter on constant true must be eliminated", result instanceof OpenSearchFilter);
         assertTrue("root must be the scan after filter elimination", result instanceof OpenSearchTableScan);
+    }
+
+    // ---- Delegation preference tests ----
+
+    /**
+     * Fields with both doc values (parquet) and index formats (lucene), so both backends
+     * are viable for filter predicates.
+     */
+    private Map<String, FieldStorageInfo> fieldsWithLuceneIndex() {
+        return Map.of(
+            "status",
+            new FieldStorageInfo(
+                "status",
+                "integer",
+                FieldType.INTEGER,
+                List.of(MockDataFusionBackend.PARQUET_DATA_FORMAT, MockLuceneBackend.LUCENE_DATA_FORMAT),
+                List.of(MockLuceneBackend.LUCENE_DATA_FORMAT),
+                List.of(),
+                false
+            ),
+            "size",
+            new FieldStorageInfo(
+                "size",
+                "integer",
+                FieldType.INTEGER,
+                List.of(MockDataFusionBackend.PARQUET_DATA_FORMAT, MockLuceneBackend.LUCENE_DATA_FORMAT),
+                List.of(MockLuceneBackend.LUCENE_DATA_FORMAT),
+                List.of(),
+                false
+            )
+        );
+    }
+
+    /**
+     * Fields with only doc values in parquet format (no lucene index), so only DataFusion
+     * is viable for filter predicates.
+     */
+    private Map<String, FieldStorageInfo> fieldsWithoutLuceneIndex() {
+        return Map.of(
+            "status",
+            new FieldStorageInfo(
+                "status",
+                "integer",
+                FieldType.INTEGER,
+                List.of(MockDataFusionBackend.PARQUET_DATA_FORMAT),
+                List.of(),
+                List.of(),
+                false
+            ),
+            "size",
+            new FieldStorageInfo(
+                "size",
+                "integer",
+                FieldType.INTEGER,
+                List.of(MockDataFusionBackend.PARQUET_DATA_FORMAT),
+                List.of(),
+                List.of(),
+                false
+            )
+        );
+    }
+
+    private QueryDAG buildAndForkWithDelegation(
+        Map<String, FieldStorageInfo> fieldStorage,
+        List<AnalyticsSearchBackendPlugin> backends,
+        RelNode logicalPlan
+    ) {
+        PlannerContext context = buildContextWithExplicitStorage(1, fieldStorage, backends);
+        RelNode cboOutput = runPlanner(logicalPlan, context);
+        QueryDAG dag = DAGBuilder.build(cboOutput, context.getCapabilityRegistry(), mockClusterService());
+        PlanForker.forkAll(dag, context.getCapabilityRegistry());
+        return dag;
+    }
+
+    /**
+     * Finds the annotation backend for the first predicate annotation in the resolved filter.
+     * After forking, annotations are narrowed to a single backend.
+     */
+    private String getFirstAnnotationBackend(StagePlan plan) {
+        RelNode fragment = plan.resolvedFragment();
+        assertTrue("resolved fragment must be OpenSearchFilter", fragment instanceof OpenSearchFilter);
+        OpenSearchFilter filter = (OpenSearchFilter) fragment;
+        List<OperatorAnnotation> annotations = filter.getAnnotations();
+        assertFalse("filter must have at least one annotation", annotations.isEmpty());
+        OperatorAnnotation annotation = annotations.get(0);
+        assertEquals("annotation must be narrowed to single backend", 1, annotation.getViableBackends().size());
+        return annotation.getViableBackends().getFirst();
+    }
+
+    private StagePlan findPlanForBackend(QueryDAG dag, String backendId) {
+        for (StagePlan plan : dag.rootStage().getPlanAlternatives()) {
+            if (plan.backendId().equals(backendId)) {
+                return plan;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * When Lucene accepts delegation and the predicate is EQUALS, the annotation
+     * should be narrowed to Lucene (delegation target) rather than DataFusion.
+     */
+    public void testEqualsDelegationPrefersLucene() {
+        MockLuceneBackend lucene = new MockLuceneBackend() {
+            @Override
+            protected Set<ScanCapability> scanCapabilities() {
+                return Set.of(new ScanCapability.DocValues(Set.of(MockLuceneBackend.LUCENE_DATA_FORMAT), SUPPORTED_TYPES));
+            }
+
+            @Override
+            protected Set<DelegationType> acceptedDelegations() {
+                return Set.of(DelegationType.FILTER);
+            }
+        };
+        MockDataFusionBackend datafusion = new MockDataFusionBackend() {
+            @Override
+            protected Set<DelegationType> supportedDelegations() {
+                return Set.of(DelegationType.FILTER);
+            }
+        };
+
+        RelNode filter = LogicalFilter.create(stubScan(mockTable("test_index", "status", "size")), makeEquals(0, SqlTypeName.INTEGER, 200));
+
+        QueryDAG dag = buildAndForkWithDelegation(fieldsWithLuceneIndex(), List.of(datafusion, lucene), filter);
+
+        StagePlan dfPlan = findPlanForBackend(dag, MockDataFusionBackend.NAME);
+        assertNotNull("DataFusion plan alternative must exist", dfPlan);
+        String annotationBackend = getFirstAnnotationBackend(dfPlan);
+        assertEquals("EQUALS annotation must be narrowed to Lucene (delegation target)", MockLuceneBackend.NAME, annotationBackend);
+    }
+
+    /**
+     * When Lucene accepts delegation but the predicate is GREATER_THAN (not in
+     * DELEGATION_PREFERRED_FUNCTIONS), the annotation should remain on DataFusion.
+     */
+    public void testGreaterThanDelegationNotPreferred() {
+        MockLuceneBackend lucene = new MockLuceneBackend() {
+            @Override
+            protected Set<ScanCapability> scanCapabilities() {
+                return Set.of(new ScanCapability.DocValues(Set.of(MockLuceneBackend.LUCENE_DATA_FORMAT), SUPPORTED_TYPES));
+            }
+
+            @Override
+            protected Set<DelegationType> acceptedDelegations() {
+                return Set.of(DelegationType.FILTER);
+            }
+        };
+        MockDataFusionBackend datafusion = new MockDataFusionBackend() {
+            @Override
+            protected Set<DelegationType> supportedDelegations() {
+                return Set.of(DelegationType.FILTER);
+            }
+        };
+
+        RelNode filter = LogicalFilter.create(
+            stubScan(mockTable("test_index", "status", "size")),
+            makeCall(
+                SqlStdOperatorTable.GREATER_THAN,
+                rexBuilder.makeInputRef(typeFactory.createSqlType(SqlTypeName.INTEGER), 0),
+                rexBuilder.makeLiteral(100, typeFactory.createSqlType(SqlTypeName.INTEGER), true)
+            )
+        );
+
+        QueryDAG dag = buildAndForkWithDelegation(fieldsWithLuceneIndex(), List.of(datafusion, lucene), filter);
+
+        StagePlan dfPlan = findPlanForBackend(dag, MockDataFusionBackend.NAME);
+        assertNotNull("DataFusion plan alternative must exist", dfPlan);
+        String annotationBackend = getFirstAnnotationBackend(dfPlan);
+        assertEquals(
+            "GREATER_THAN annotation must remain on DataFusion (no delegation for non-EQUALS)",
+            MockDataFusionBackend.NAME,
+            annotationBackend
+        );
+    }
+
+    /**
+     * When only DataFusion is viable for EQUALS (field has no lucene index format),
+     * the annotation should narrow to DataFusion for native evaluation.
+     */
+    public void testEqualsWithOnlyDataFusionViableNarrowsToDataFusion() {
+        MockLuceneBackend lucene = new MockLuceneBackend() {
+            @Override
+            protected Set<ScanCapability> scanCapabilities() {
+                return Set.of(new ScanCapability.DocValues(Set.of(MockLuceneBackend.LUCENE_DATA_FORMAT), SUPPORTED_TYPES));
+            }
+
+            @Override
+            protected Set<DelegationType> acceptedDelegations() {
+                return Set.of(DelegationType.FILTER);
+            }
+        };
+        MockDataFusionBackend datafusion = new MockDataFusionBackend() {
+            @Override
+            protected Set<DelegationType> supportedDelegations() {
+                return Set.of(DelegationType.FILTER);
+            }
+        };
+
+        RelNode filter = LogicalFilter.create(stubScan(mockTable("test_index", "status", "size")), makeEquals(0, SqlTypeName.INTEGER, 200));
+
+        // Fields without lucene index — only DataFusion is viable for filter
+        QueryDAG dag = buildAndForkWithDelegation(fieldsWithoutLuceneIndex(), List.of(datafusion, lucene), filter);
+
+        StagePlan dfPlan = findPlanForBackend(dag, MockDataFusionBackend.NAME);
+        assertNotNull("DataFusion plan alternative must exist", dfPlan);
+        String annotationBackend = getFirstAnnotationBackend(dfPlan);
+        assertEquals(
+            "EQUALS annotation must narrow to DataFusion when Lucene is not viable",
+            MockDataFusionBackend.NAME,
+            annotationBackend
+        );
+    }
+
+    /**
+     * When no delegation acceptor exists among viable backends (Lucene does not accept
+     * delegation), the EQUALS annotation falls back to the operator backend (DataFusion).
+     */
+    public void testEqualsWithNoDelegationAcceptorFallsBackToOperatorBackend() {
+        // Standard MockLuceneBackend does NOT accept delegation (acceptedDelegations returns empty)
+        MockLuceneBackend luceneNoDelegation = new MockLuceneBackend() {
+            @Override
+            protected Set<ScanCapability> scanCapabilities() {
+                return Set.of(new ScanCapability.DocValues(Set.of(MockLuceneBackend.LUCENE_DATA_FORMAT), SUPPORTED_TYPES));
+            }
+        };
+        MockDataFusionBackend datafusion = new MockDataFusionBackend() {
+            @Override
+            protected Set<DelegationType> supportedDelegations() {
+                return Set.of(DelegationType.FILTER);
+            }
+        };
+
+        RelNode filter = LogicalFilter.create(stubScan(mockTable("test_index", "status", "size")), makeEquals(0, SqlTypeName.INTEGER, 200));
+
+        QueryDAG dag = buildAndForkWithDelegation(fieldsWithLuceneIndex(), List.of(datafusion, luceneNoDelegation), filter);
+
+        StagePlan dfPlan = findPlanForBackend(dag, MockDataFusionBackend.NAME);
+        assertNotNull("DataFusion plan alternative must exist", dfPlan);
+        String annotationBackend = getFirstAnnotationBackend(dfPlan);
+        assertEquals(
+            "EQUALS annotation must fall back to DataFusion when no delegation acceptor exists",
+            MockDataFusionBackend.NAME,
+            annotationBackend
+        );
+    }
+
+    // ---- IN delegation preference tests ----
+
+    /**
+     * SqlFunction with name "IN" for constructing IN-like RexCalls in tests.
+     * Uses SqlKind.OTHER_FUNCTION to bypass Calcite's operand validation assertions.
+     * ScalarFunction.fromSqlOperatorWithFallback resolves via name fallback: valueOf("IN") → ScalarFunction.IN.
+     */
+    private static final SqlFunction IN_FUNCTION = new SqlFunction(
+        "IN",
+        SqlKind.OTHER_FUNCTION,
+        ReturnTypes.BOOLEAN,
+        null,
+        OperandTypes.VARIADIC,
+        SqlFunctionCategory.USER_DEFINED_FUNCTION
+    );
+
+    /**
+     * Creates an IN predicate RexCall: field IN (value1, value2, ...).
+     * The first operand is a RexInputRef, followed by RexLiteral values.
+     */
+    private RexNode makeIn(int fieldIndex, SqlTypeName fieldType, Object... values) {
+        var type = typeFactory.createSqlType(fieldType);
+        RexNode[] operands = new RexNode[values.length + 1];
+        operands[0] = rexBuilder.makeInputRef(type, fieldIndex);
+        for (int i = 0; i < values.length; i++) {
+            operands[i + 1] = rexBuilder.makeLiteral(values[i], type, true);
+        }
+        return rexBuilder.makeCall(IN_FUNCTION, operands);
+    }
+
+    /**
+     * When Lucene accepts delegation and the predicate is IN, the annotation
+     * should be narrowed to Lucene (delegation target) rather than DataFusion.
+     */
+    public void testInDelegationPrefersLucene() {
+        MockLuceneBackend lucene = new MockLuceneBackend() {
+            @Override
+            protected Set<ScanCapability> scanCapabilities() {
+                return Set.of(new ScanCapability.DocValues(Set.of(MockLuceneBackend.LUCENE_DATA_FORMAT), SUPPORTED_TYPES));
+            }
+
+            @Override
+            protected Set<DelegationType> acceptedDelegations() {
+                return Set.of(DelegationType.FILTER);
+            }
+        };
+        MockDataFusionBackend datafusion = new MockDataFusionBackend() {
+            @Override
+            protected Set<DelegationType> supportedDelegations() {
+                return Set.of(DelegationType.FILTER);
+            }
+        };
+
+        RelNode filter = LogicalFilter.create(
+            stubScan(mockTable("test_index", "status", "size")),
+            makeIn(0, SqlTypeName.INTEGER, 100, 200, 300)
+        );
+
+        QueryDAG dag = buildAndForkWithDelegation(fieldsWithLuceneIndex(), List.of(datafusion, lucene), filter);
+
+        StagePlan dfPlan = findPlanForBackend(dag, MockDataFusionBackend.NAME);
+        assertNotNull("DataFusion plan alternative must exist", dfPlan);
+        String annotationBackend = getFirstAnnotationBackend(dfPlan);
+        assertEquals("IN annotation must be narrowed to Lucene (delegation target)", MockLuceneBackend.NAME, annotationBackend);
+    }
+
+    /**
+     * When only DataFusion is viable for IN (field has no lucene index format),
+     * the annotation should narrow to DataFusion for native evaluation.
+     */
+    public void testInWithOnlyDataFusionViableNarrowsToDataFusion() {
+        MockLuceneBackend lucene = new MockLuceneBackend() {
+            @Override
+            protected Set<ScanCapability> scanCapabilities() {
+                return Set.of(new ScanCapability.DocValues(Set.of(MockLuceneBackend.LUCENE_DATA_FORMAT), SUPPORTED_TYPES));
+            }
+
+            @Override
+            protected Set<DelegationType> acceptedDelegations() {
+                return Set.of(DelegationType.FILTER);
+            }
+        };
+        MockDataFusionBackend datafusion = new MockDataFusionBackend() {
+            @Override
+            protected Set<DelegationType> supportedDelegations() {
+                return Set.of(DelegationType.FILTER);
+            }
+        };
+
+        RelNode filter = LogicalFilter.create(
+            stubScan(mockTable("test_index", "status", "size")),
+            makeIn(0, SqlTypeName.INTEGER, 100, 200, 300)
+        );
+
+        // Fields without lucene index — only DataFusion is viable for filter
+        QueryDAG dag = buildAndForkWithDelegation(fieldsWithoutLuceneIndex(), List.of(datafusion, lucene), filter);
+
+        StagePlan dfPlan = findPlanForBackend(dag, MockDataFusionBackend.NAME);
+        assertNotNull("DataFusion plan alternative must exist", dfPlan);
+        String annotationBackend = getFirstAnnotationBackend(dfPlan);
+        assertEquals("IN annotation must narrow to DataFusion when Lucene is not viable", MockDataFusionBackend.NAME, annotationBackend);
     }
 }
