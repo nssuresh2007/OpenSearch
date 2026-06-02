@@ -15,6 +15,9 @@ import org.apache.calcite.sql.util.SqlOperatorTables;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.action.ActionRequest;
+import org.opensearch.analytics.aggregation.AggregationDelegationService;
+import org.opensearch.analytics.aggregation.BackendRouter;
+import org.opensearch.analytics.aggregation.BitsetProviderRegistry;
 import org.opensearch.analytics.exec.AnalyticsSearchService;
 import org.opensearch.analytics.exec.CoordinatorAllocatorHandle;
 import org.opensearch.analytics.exec.DefaultPlanExecutor;
@@ -30,6 +33,7 @@ import org.opensearch.analytics.spi.AnalyticsSearchBackendPlugin;
 import org.opensearch.analytics.stats.AnalyticsStats;
 import org.opensearch.analytics.stats.AnalyticsStatsCollector;
 import org.opensearch.analytics.stats.RestAnalyticsStatsAction;
+import org.opensearch.analytics.spi.BackendAggregationExecutor;
 import org.opensearch.arrow.allocator.ArrowNativeAllocator;
 import org.opensearch.arrow.spi.NativeAllocatorPoolConfig;
 import org.opensearch.cluster.ClusterState;
@@ -54,10 +58,14 @@ import org.opensearch.plugins.ExtensiblePlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.plugins.PluginComponentRegistry;
 import org.opensearch.plugins.SearchStatsContributor;
+import org.opensearch.plugins.SearchPlugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestHandler;
 import org.opensearch.script.ScriptService;
+import org.opensearch.search.aggregations.AggregationProcessor;
+import org.opensearch.search.query.QueryPhase;
+import org.opensearch.search.query.QueryPhaseSearcher;
 import org.opensearch.threadpool.ExecutorBuilder;
 import org.opensearch.threadpool.FixedExecutorBuilder;
 import org.opensearch.threadpool.ThreadPool;
@@ -66,9 +74,11 @@ import org.opensearch.watcher.ResourceWatcherService;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.Supplier;
 
 /**
@@ -77,7 +87,7 @@ import java.util.function.Supplier;
  *
  * @opensearch.internal
  */
-public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionPlugin, SearchStatsContributor {
+public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionPlugin, SearchStatsContributor, SearchPlugin {
 
     private static final Logger logger = LogManager.getLogger(AnalyticsPlugin.class);
 
@@ -113,6 +123,10 @@ public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionP
     private CoordinatorAllocatorHandle coordinatorAllocatorHandle;
     private ReaderContextStore readerContextStore;
     private final AnalyticsStatsCollector statsCollector = new AnalyticsStatsCollector();
+    private BackendRouter backendRouter;
+    private BitsetProviderRegistry bitsetProviderRegistry;
+    private AggregationDelegationService delegationService;
+    private AnalyticsQueryPhaseSearcher queryPhaseSearcher;
 
     @SuppressWarnings("rawtypes")
     @Override
@@ -144,6 +158,22 @@ public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionP
         for (AnalyticsSearchBackendPlugin be : backEnds) {
             backEndsByName.put(be.name(), be);
         }
+
+        // Build the BackendRouter from discovered backends that provide aggregation executors.
+        // Use a lazy approach: store the backend plugins and resolve executors on first use.
+        // This avoids triggering DataFusionFragmentConvertor's static initializer at startup,
+        // which can fail due to Substrait extension loading in the plugin classloader context.
+        backendRouter = new BackendRouter(backEnds);
+
+        // Create the BitsetProviderRegistry (node-level singleton for FFM callback access)
+        bitsetProviderRegistry = new BitsetProviderRegistry();
+
+        // Create the AggregationDelegationService
+        delegationService = new AggregationDelegationService(backendRouter, bitsetProviderRegistry);
+
+        // Create the AnalyticsQueryPhaseSearcher
+        queryPhaseSearcher = new AnalyticsQueryPhaseSearcher(capabilityRegistry, backendRouter, bitsetProviderRegistry, delegationService);
+
         readerContextStore = new ReaderContextStore(threadPool);
         clusterService.getClusterSettings()
             .addSettingsUpdateConsumer(ReaderContextStore.READER_CONTEXT_KEEP_ALIVE, readerContextStore::setKeepAlive);
@@ -201,6 +231,46 @@ public class AnalyticsPlugin extends Plugin implements ExtensiblePlugin, ActionP
         settings.add(ReaderContextStore.READER_CONTEXT_KEEP_ALIVE);
         settings.addAll(org.opensearch.analytics.settings.AnalyticsApproximationSettings.all());
         return List.copyOf(settings);
+    }
+
+    @Override
+    public Optional<QueryPhaseSearcher> getQueryPhaseSearcher() {
+        // Return a lazy wrapper because getQueryPhaseSearcher() is called by SearchModule
+        // during node construction, BEFORE createComponents() sets up the real searcher.
+        // The wrapper delegates to the real AnalyticsQueryPhaseSearcher once it's initialized.
+        return Optional.of(new LazyDelegatingQueryPhaseSearcher());
+    }
+
+    /**
+     * A {@link QueryPhaseSearcher} that lazily delegates to the real {@link AnalyticsQueryPhaseSearcher}
+     * once it's initialized in {@link #createComponents}. Before initialization, it falls back to
+     * the default behavior (no delegation).
+     */
+    private class LazyDelegatingQueryPhaseSearcher implements QueryPhaseSearcher {
+        @Override
+        public boolean searchWith(
+            org.opensearch.search.internal.SearchContext searchContext,
+            org.opensearch.search.internal.ContextIndexSearcher searcher,
+            org.apache.lucene.search.Query query,
+            java.util.LinkedList<org.opensearch.search.query.QueryCollectorContext> collectors,
+            boolean hasFilterCollector,
+            boolean hasTimeout
+        ) throws java.io.IOException {
+            if (queryPhaseSearcher != null) {
+                return queryPhaseSearcher.searchWith(searchContext, searcher, query, collectors, hasFilterCollector, hasTimeout);
+            }
+            return QueryPhase.DEFAULT_QUERY_PHASE_SEARCHER.searchWith(
+                searchContext, searcher, query, collectors, hasFilterCollector, hasTimeout
+            );
+        }
+
+        @Override
+        public AggregationProcessor aggregationProcessor(org.opensearch.search.internal.SearchContext searchContext) {
+            if (queryPhaseSearcher != null) {
+                return queryPhaseSearcher.aggregationProcessor(searchContext);
+            }
+            return QueryPhase.DEFAULT_QUERY_PHASE_SEARCHER.aggregationProcessor(searchContext);
+        }
     }
 
     @Override

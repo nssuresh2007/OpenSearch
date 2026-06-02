@@ -106,8 +106,21 @@ dependencies {
   // jars in via the project dep — tests then use the same Arrow + Netty allocator as production.
   testImplementation project(':plugins:arrow-base')
 
+  // analytics-backend-datafusion — needed by unit tests that exercise PartialAggregationAdapter
+  testImplementation project(':sandbox:plugins:analytics-backend-datafusion')
+
   // Arrow Flight streaming transport for ITs
   internalClusterTestImplementation project(':plugins:arrow-flight-rpc')
+
+  // Arrow base — provides Arrow memory/vector classes, SLF4J, and the unified native-allocator
+  // framework required by ArrowBasePlugin in integration tests (flat classpath, no plugin classloader).
+  internalClusterTestImplementation project(':plugins:arrow-base')
+
+  // Composite engine, parquet data format, and backend plugins for aggregation delegation ITs
+  internalClusterTestImplementation project(':sandbox:plugins:composite-engine')
+  internalClusterTestImplementation project(':sandbox:plugins:parquet-data-format')
+  internalClusterTestImplementation project(':sandbox:plugins:analytics-backend-datafusion')
+  internalClusterTestImplementation project(':sandbox:plugins:analytics-backend-lucene')
 
   // Calcite bytecode references @Immutable from immutables — resolve at test compile time
   testCompileOnly 'org.immutables:value-annotations:2.8.8'
@@ -161,6 +174,24 @@ configurations.runtimeClasspath {
   exclude group: 'org.slf4j', module: 'slf4j-api'
   exclude group: 'commons-codec', module: 'commons-codec'
   exclude group: 'com.fasterxml.jackson.core'
+}
+
+// The runtimeClasspath exclusion above propagates to internalClusterTestRuntimeClasspath
+// via Gradle configuration inheritance. Integration tests run on a flat classpath (no
+// plugin classloader) and need slf4j-api for Arrow memory init. Use a detached config
+// to inject it without being affected by the inherited exclusion.
+configurations {
+  internalClusterTestSlf4j
+}
+dependencies {
+  internalClusterTestSlf4j "org.slf4j:slf4j-api:${versions.slf4j}"
+  internalClusterTestSlf4j "com.fasterxml.jackson.core:jackson-core:${versions.jackson}"
+  internalClusterTestSlf4j "com.fasterxml.jackson.core:jackson-databind:${versions.jackson_databind}"
+  internalClusterTestSlf4j "com.fasterxml.jackson.core:jackson-annotations:${versions.jackson_annotations}"
+  internalClusterTestSlf4j "commons-codec:commons-codec:${versions.commonscodec}"
+}
+tasks.named('internalClusterTest').configure {
+  classpath += configurations.internalClusterTestSlf4j
 }
 
 configurations.all {
@@ -225,10 +256,14 @@ internalClusterTest {
   jvmArgs '--add-opens=java.base/java.nio=ALL-UNNAMED'
   jvmArgs '--add-opens=java.base/java.lang=ALL-UNNAMED'
   jvmArgs '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED'
+  jvmArgs '--enable-native-access=ALL-UNNAMED'
   jvmArgs '-Darrow.memory.debug.allocator=false'
   systemProperty 'io.netty.allocator.numDirectArenas', '1'
   systemProperty 'io.netty.noUnsafe', 'false'
   systemProperty 'io.netty.tryUnsafe', 'true'
   systemProperty 'io.netty.tryReflectionSetAccessible', 'true'
+  // DataFusion backend requires the native lib path so JNI can locate the native library
+  systemProperty 'native.lib.path', project(':sandbox:libs:dataformat-native').ext.nativeLibPath.absolutePath
+  dependsOn ':sandbox:libs:dataformat-native:buildRustLibrary'
   jvmArgs += ["--add-opens", "java.base/java.nio=org.apache.arrow.memory.core,ALL-UNNAMED"]
 }

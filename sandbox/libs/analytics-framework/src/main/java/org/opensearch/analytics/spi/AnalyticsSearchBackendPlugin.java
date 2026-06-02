@@ -194,4 +194,21 @@ public interface AnalyticsSearchBackendPlugin {
     default Map<ScalarFunction, DelegatedPredicateSerializer> delegatedPredicateSerializers() {
         return Map.of();
     }
+
+    /**
+     * Returns the per-segment aggregation executor for this backend, or {@code null} if
+     * the backend does not participate in per-segment aggregation delegation.
+     *
+     * <p>Backends that return {@code null} are excluded from the aggregation delegation
+     * candidate pool by the eligibility classifier, even if their
+     * {@link BackendCapabilityProvider#aggregateCapabilities()} would otherwise match.
+     * This lets a backend declare planner-level aggregate capabilities (used by the
+     * analytics-engine path) without committing to the per-segment delegation surface.
+     *
+     * @return the executor, or {@code null} if this backend does not support per-segment
+     *         aggregation delegation
+     */
+    default BackendAggregationExecutor aggregationExecutor() {
+        return null;
+    }
 }

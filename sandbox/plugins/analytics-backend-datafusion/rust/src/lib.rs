@@ -21,6 +21,7 @@
 pub const ROW_ID_COLUMN_NAME: &str = "__row_id__";
 
 pub(crate) mod agg_mode;
+pub mod aggregation_executor;
 pub mod api;
 pub mod cache;
 pub mod cancellation;

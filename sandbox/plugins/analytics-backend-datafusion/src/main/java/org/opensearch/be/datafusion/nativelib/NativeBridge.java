@@ -11,6 +11,7 @@ package org.opensearch.be.datafusion.nativelib;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.analytics.backend.jni.NativeHandle;
+import org.opensearch.analytics.spi.BackendExecutionException;
 import org.opensearch.analytics.spi.QueryExecutionMetrics;
 import org.opensearch.be.datafusion.stats.DataFusionStats;
 import org.opensearch.be.datafusion.stats.NativeExecutorsStats;
@@ -117,6 +118,8 @@ public final class NativeBridge {
     private static final MethodHandle PREPARE_FINAL_PLAN;
     private static final MethodHandle EXECUTE_LOCAL_PREPARED_PLAN;
     private static final MethodHandle FETCH_BY_ROW_IDS;
+    private static final MethodHandle EXECUTE_AGGREGATION_WITH_CONTEXT;
+    private static final MethodHandle FREE_IPC_BYTES;
 
     static {
         SymbolLookup lib = NativeLibraryLoader.symbolLookup();
@@ -531,6 +534,28 @@ public final class NativeBridge {
                 ValueLayout.JAVA_LONG,
                 ValueLayout.JAVA_LONG
             )
+        );
+
+        // i64 df_execute_aggregation_with_context(session_ctx_ptr, substrait_ptr, substrait_len,
+        // provider_key, writer_generation, out_ptr, out_len)
+        EXECUTE_AGGREGATION_WITH_CONTEXT = linker.downcallHandle(
+            lib.find("df_execute_aggregation_with_context").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,   // return: i64 (0 on success, negated error ptr on failure)
+                ValueLayout.JAVA_LONG,   // session_ctx_ptr
+                ValueLayout.ADDRESS,     // substrait_ptr
+                ValueLayout.JAVA_INT,    // substrait_len
+                ValueLayout.JAVA_INT,    // provider_key
+                ValueLayout.JAVA_LONG,   // writer_generation
+                ValueLayout.ADDRESS,     // out_ptr (*mut *mut u8)
+                ValueLayout.ADDRESS      // out_len (*mut i32)
+            )
+        );
+
+        // void df_free_ipc_bytes(ptr, len)
+        FREE_IPC_BYTES = linker.downcallHandle(
+            lib.find("df_free_ipc_bytes").orElseThrow(),
+            FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_INT)
         );
     }
 
@@ -1332,6 +1357,84 @@ public final class NativeBridge {
         NativeHandle.validatePointer(sessionPtr, "session");
         try (var call = new NativeCall()) {
             return call.invoke(EXECUTE_LOCAL_PREPARED_PLAN, sessionPtr, contextId);
+        }
+    }
+
+    // ---- Aggregation delegation (per-segment, returns Arrow IPC bytes) ----
+
+    /**
+     * Executes an aggregation plan on a pre-configured SessionContext and returns the
+     * result as Arrow IPC bytes.
+     *
+     * <p>The session context must have been created via
+     * {@link #createSessionContextForIndexedExecution} (or equivalent) with the segment's
+     * Parquet file already registered. The {@code providerKey} identifies the pre-registered
+     * bitset on the Java side ({@code BitsetProviderRegistry}) and {@code writerGeneration}
+     * identifies the target segment.
+     *
+     * <p>On success, the Rust side allocates the Arrow IPC result bytes on the Rust heap.
+     * This method reads the bytes into a Java {@code byte[]} and then frees the native
+     * allocation via {@code df_free_ipc_bytes}.
+     *
+     * @param sessionCtxPtr    pointer to a SessionContext handle (consumed by Rust on entry)
+     * @param substraitBytes   Substrait plan bytes describing the aggregation
+     * @param providerKey      key identifying the bitset provider in BitsetProviderRegistry
+     * @param writerGeneration writer generation identifying the target segment
+     * @return Arrow IPC bytes containing the aggregation result RecordBatches
+     * @throws BackendExecutionException if the native execution fails
+     */
+    public static byte[] executeAggregationWithContext(long sessionCtxPtr, byte[] substraitBytes, int providerKey, long writerGeneration)
+        throws BackendExecutionException {
+        NativeHandle.validatePointer(sessionCtxPtr, "sessionContext");
+        if (substraitBytes == null || substraitBytes.length == 0) {
+            throw new BackendExecutionException("substraitBytes must be non-null and non-empty");
+        }
+        try (var arena = Arena.ofConfined()) {
+            // Allocate input substrait bytes in the confined arena
+            MemorySegment substraitSeg = arena.allocateFrom(ValueLayout.JAVA_BYTE, substraitBytes);
+
+            // Allocate output pointer and length segments
+            MemorySegment outPtrSeg = arena.allocate(ValueLayout.ADDRESS);
+            MemorySegment outLenSeg = arena.allocate(ValueLayout.JAVA_INT);
+
+            // Invoke the native function
+            long result = (long) EXECUTE_AGGREGATION_WITH_CONTEXT.invokeExact(
+                sessionCtxPtr,
+                substraitSeg,
+                substraitBytes.length,
+                providerKey,
+                writerGeneration,
+                outPtrSeg,
+                outLenSeg
+            );
+
+            // Check for error (negative result = negated pointer to error string)
+            NativeLibraryLoader.checkResult(result);
+
+            // Read the output pointer and length
+            MemorySegment nativePtr = outPtrSeg.get(ValueLayout.ADDRESS, 0);
+            int ipcLen = outLenSeg.get(ValueLayout.JAVA_INT, 0);
+
+            if (ipcLen <= 0 || nativePtr.equals(MemorySegment.NULL)) {
+                throw new BackendExecutionException(
+                    "df_execute_aggregation_with_context returned success but output is empty (len=" + ipcLen + ")"
+                );
+            }
+
+            // Reinterpret the native pointer to the correct size so we can read from it
+            MemorySegment ipcSegment = nativePtr.reinterpret(ipcLen);
+
+            // Copy the Arrow IPC bytes from the native allocation into a Java byte[]
+            byte[] ipcBytes = ipcSegment.toArray(ValueLayout.JAVA_BYTE);
+
+            // Free the native allocation
+            FREE_IPC_BYTES.invokeExact(nativePtr, ipcLen);
+
+            return ipcBytes;
+        } catch (BackendExecutionException e) {
+            throw e;
+        } catch (Throwable t) {
+            throw new BackendExecutionException("Failed to execute aggregation via DataFusion FFM bridge", t);
         }
     }
 

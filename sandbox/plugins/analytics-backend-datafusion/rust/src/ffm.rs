@@ -1161,3 +1161,109 @@ pub unsafe extern "C" fn df_execute_local_prepared_plan(
     // call and gating it can deadlock).
     api::execute_local_prepared_plan(session_ptr, &mgr, context_id, None).map_err(|e| e.to_string())
 }
+
+// ---------------------------------------------------------------------------
+// Aggregation delegation — per-segment execution
+//
+// Executes a Substrait aggregation plan against a pre-configured
+// SessionContext with a bitset-provider-backed row filter. The result is
+// Arrow IPC bytes written to caller-provided output pointers.
+// ---------------------------------------------------------------------------
+
+/// Executes an aggregation plan on a pre-configured SessionContext.
+///
+/// The session context must have been created via `df_create_session_context_indexed`
+/// (or equivalent) with the segment's Parquet file already registered. The
+/// `provider_key` identifies the pre-registered bitset on the Java side
+/// (BitsetProviderRegistry) and `writer_generation` identifies the target segment.
+///
+/// On success, allocates the Arrow IPC result bytes on the Rust heap and writes
+/// the pointer and byte count through `out_ptr` / `out_len`. The caller (Java)
+/// is responsible for reading the bytes and then freeing the allocation via
+/// `df_free_ipc_bytes`.
+///
+/// # Safety
+///
+/// - `session_ctx_ptr` must be a valid pointer to a heap-allocated
+///   `SessionContextHandle` produced by `df_create_session_context_indexed`.
+///   The pointer is consumed (Box::from_raw) — the caller must not use it
+///   after this call returns.
+/// - `substrait_ptr` must point to `substrait_len` valid bytes.
+/// - `out_ptr` and `out_len` must be non-null and writable.
+///
+/// # Returns
+///
+/// `0` on success (via `#[ffm_safe]` → `Ok(0)`). On error, returns a negated
+/// heap-allocated error-string pointer per the standard FFM error convention.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn df_execute_aggregation_with_context(
+    session_ctx_ptr: i64,
+    substrait_ptr: *const u8,
+    substrait_len: i32,
+    provider_key: i32,
+    writer_generation: i64,
+    out_ptr: *mut *mut u8,
+    out_len: *mut i32,
+) -> i64 {
+    if substrait_ptr.is_null() {
+        return Err("df_execute_aggregation_with_context: null substrait pointer".to_string());
+    }
+    if out_ptr.is_null() || out_len.is_null() {
+        return Err("df_execute_aggregation_with_context: null output pointer".to_string());
+    }
+    if substrait_len < 0 {
+        return Err(format!(
+            "df_execute_aggregation_with_context: negative substrait_len: {}",
+            substrait_len
+        ));
+    }
+
+    let mgr = get_rt_manager()?;
+    let substrait_bytes = slice::from_raw_parts(substrait_ptr, substrait_len as usize).to_vec();
+
+    let mgr_for_spawn = Arc::clone(&mgr);
+
+    let ipc_bytes = timed_block_on(&mgr.io_runtime, "execute_aggregation_with_context", async move {
+        let inner_fut = crate::task_monitors::query_execution_monitor().instrument(async move {
+            crate::aggregation_executor::execute_aggregation_with_context(
+                session_ctx_ptr,
+                substrait_bytes,
+                provider_key,
+                writer_generation,
+            )
+            .await
+        });
+        match mgr_for_spawn.cpu_executor().spawn(inner_fut).await {
+            Ok(inner) => inner,
+            Err(e) => Err(datafusion::error::DataFusionError::Execution(format!(
+                "df_execute_aggregation_with_context: CPU spawn failed: {e:?}"
+            ))),
+        }
+    })
+    .map_err(|e| e.to_string())?;
+
+    // Allocate the IPC bytes on the heap and write pointer + length to output params.
+    // The caller (Java) reads the bytes and must call `df_free_ipc_bytes` to free.
+    let len = ipc_bytes.len();
+    let boxed = ipc_bytes.into_boxed_slice();
+    let raw_ptr = Box::into_raw(boxed) as *mut u8;
+    *out_ptr = raw_ptr;
+    *out_len = len as i32;
+
+    Ok(0)
+}
+
+/// Frees Arrow IPC bytes previously allocated by `df_execute_aggregation_with_context`.
+///
+/// # Safety
+///
+/// `ptr` must be a pointer returned by `df_execute_aggregation_with_context` via
+/// `out_ptr`, and `len` must be the corresponding `out_len` value. Calling this
+/// with any other pointer/length pair is undefined behaviour.
+#[no_mangle]
+pub unsafe extern "C" fn df_free_ipc_bytes(ptr: *mut u8, len: i32) {
+    if !ptr.is_null() && len > 0 {
+        let _ = Box::from_raw(slice::from_raw_parts_mut(ptr, len as usize));
+    }
+}

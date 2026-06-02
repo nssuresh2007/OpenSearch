@@ -21,6 +21,7 @@ import org.opensearch.analytics.spi.AbstractNameMappingAdapter;
 import org.opensearch.analytics.spi.AggregateCapability;
 import org.opensearch.analytics.spi.AggregateFunction;
 import org.opensearch.analytics.spi.AnalyticsSearchBackendPlugin;
+import org.opensearch.analytics.spi.BackendAggregationExecutor;
 import org.opensearch.analytics.spi.BackendCapabilityProvider;
 import org.opensearch.analytics.spi.BackendExecutionContext;
 import org.opensearch.analytics.spi.DelegationThreadTracker;
@@ -58,6 +59,7 @@ import org.opensearch.index.engine.exec.IndexReaderProvider.Reader;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * SPI extension discovered by analytics-engine via {@code META-INF/services}.
@@ -426,6 +428,12 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
 
     private final DataFusionPlugin plugin;
 
+    /**
+     * Lazily-initialized singleton aggregation executor. Created on first call to
+     * {@link #aggregationExecutor()} and reused for the lifetime of the plugin.
+     */
+    private final AtomicReference<DataFusionAggregationExecutor> aggregationExecutorRef = new AtomicReference<>();
+
     public DataFusionAnalyticsBackendPlugin(DataFusionPlugin plugin) {
         this.plugin = plugin;
     }
@@ -575,6 +583,11 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
                     }
                 }
                 return Set.copyOf(caps);
+            }
+
+            @Override
+            public int aggregationPriority() {
+                return 100;
             }
 
             @Override
@@ -899,5 +912,19 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
 
     public Exception convertException(Exception original) {
         return NativeErrorConverter.convert(original);
+    }
+
+    @Override
+    public BackendAggregationExecutor aggregationExecutor() {
+        DataFusionAggregationExecutor executor = aggregationExecutorRef.get();
+        if (executor == null) {
+            DataFusionFragmentConvertor convertor = new DataFusionFragmentConvertor(plugin.getSubstraitExtensions());
+            executor = new DataFusionAggregationExecutor(convertor, plugin);
+            if (aggregationExecutorRef.compareAndSet(null, executor) == false) {
+                // Another thread beat us — use theirs
+                executor = aggregationExecutorRef.get();
+            }
+        }
+        return executor;
     }
 }

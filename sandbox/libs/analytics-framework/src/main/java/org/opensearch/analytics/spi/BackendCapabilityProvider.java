@@ -112,4 +112,20 @@ public interface BackendCapabilityProvider {
     default Map<ScalarFunction, DelegatedPredicateSerializer> delegatedPredicateSerializers() {
         return Map.of();
     }
+
+    /**
+     * Priority for the aggregation delegation backend selection rule. Higher value = more
+     * preferred when multiple backends can serve the same {@code (function, fieldType, format)}
+     * triple. The selection rule applies in order: compatibility filter → format affinity →
+     * this priority → backend-id alphabetical tie-break.
+     *
+     * <p>DataFusion declares a positive priority for {@code "parquet"}-format fields.
+     * Alternative backends declare their own. Backends that do not participate in
+     * per-segment aggregation delegation can leave this at the default (0).
+     *
+     * @return priority value; default is 0
+     */
+    default int aggregationPriority() {
+        return 0;
+    }
 }
