@@ -10,6 +10,7 @@ package org.opensearch.be.lucene;
 
 import org.apache.lucene.index.DirectoryReader;
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.index.engine.exec.SearchableDirectoryReaderProvider;
 
 import java.util.Map;
 import java.util.Objects;
@@ -21,11 +22,17 @@ import java.util.Objects;
  * <p>Built by {@link LuceneReaderManager#afterRefresh} and consumed by
  * {@link LuceneFilterDelegationHandle} — no attribute reads or file-set matching at query time.
  *
+ * <p>Implements {@link SearchableDirectoryReaderProvider} so that the server module's
+ * {@code DataFormatAwareEngine} can obtain the {@link DirectoryReader} for the standard
+ * search path without depending on this plugin at compile time.
+ *
  * @param directoryReader the Lucene reader at the snapshot's point in time
  * @param generationToSegmentName {@code writer_generation → SegmentInfo.name in directoryReader}
  */
 @ExperimentalApi
-public record LuceneReader(DirectoryReader directoryReader, Map<Long, String> generationToSegmentName) {
+public record LuceneReader(DirectoryReader directoryReader, Map<Long, String> generationToSegmentName)
+    implements
+        SearchableDirectoryReaderProvider {
     public LuceneReader {
         Objects.requireNonNull(directoryReader, "directoryReader must not be null");
         generationToSegmentName = Map.copyOf(generationToSegmentName);
