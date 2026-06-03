@@ -537,7 +537,7 @@ public final class NativeBridge {
         );
 
         // i64 df_execute_aggregation_with_context(session_ctx_ptr, substrait_ptr, substrait_len,
-        // provider_key, writer_generation, out_ptr, out_len)
+        // provider_key, writer_generation, context_id, out_ptr, out_len)
         EXECUTE_AGGREGATION_WITH_CONTEXT = linker.downcallHandle(
             lib.find("df_execute_aggregation_with_context").orElseThrow(),
             FunctionDescriptor.of(
@@ -547,6 +547,7 @@ public final class NativeBridge {
                 ValueLayout.JAVA_INT,    // substrait_len
                 ValueLayout.JAVA_INT,    // provider_key
                 ValueLayout.JAVA_LONG,   // writer_generation
+                ValueLayout.JAVA_LONG,   // context_id
                 ValueLayout.ADDRESS,     // out_ptr (*mut *mut u8)
                 ValueLayout.ADDRESS      // out_len (*mut i32)
             )
@@ -1380,11 +1381,18 @@ public final class NativeBridge {
      * @param substraitBytes   Substrait plan bytes describing the aggregation
      * @param providerKey      key identifying the bitset provider in BitsetProviderRegistry
      * @param writerGeneration writer generation identifying the target segment
+     * @param contextId        per-query id used by Rust to route the bitset-collector upcalls
+     *                         back to the correct Java {@code FilterDelegationHandle}
      * @return Arrow IPC bytes containing the aggregation result RecordBatches
      * @throws BackendExecutionException if the native execution fails
      */
-    public static byte[] executeAggregationWithContext(long sessionCtxPtr, byte[] substraitBytes, int providerKey, long writerGeneration)
-        throws BackendExecutionException {
+    public static byte[] executeAggregationWithContext(
+        long sessionCtxPtr,
+        byte[] substraitBytes,
+        int providerKey,
+        long writerGeneration,
+        long contextId
+    ) throws BackendExecutionException {
         NativeHandle.validatePointer(sessionCtxPtr, "sessionContext");
         if (substraitBytes == null || substraitBytes.length == 0) {
             throw new BackendExecutionException("substraitBytes must be non-null and non-empty");
@@ -1404,6 +1412,7 @@ public final class NativeBridge {
                 substraitBytes.length,
                 providerKey,
                 writerGeneration,
+                contextId,
                 outPtrSeg,
                 outLenSeg
             );

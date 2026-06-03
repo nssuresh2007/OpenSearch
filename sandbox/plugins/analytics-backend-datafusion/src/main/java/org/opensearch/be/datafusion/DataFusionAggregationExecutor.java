@@ -243,9 +243,7 @@ public class DataFusionAggregationExecutor implements BackendAggregationExecutor
             // can call back to get the bitset. We use the actual matchingDocs bitset from
             // the Lucene query phase — this ensures DataFusion only aggregates over the
             // documents that matched the query.
-            org.opensearch.be.datafusion.indexfilter.FilterTreeCallbacks.register(
-                contextId, new AggBitsetHandle(matchingDocs), null
-            );
+            org.opensearch.be.datafusion.indexfilter.FilterTreeCallbacks.register(contextId, new AggBitsetHandle(matchingDocs), null);
 
             // Step 5: Invoke FFM bridge — execute_aggregation_with_context
             // Rust takes ownership of the session context via Box::from_raw; mark consumed
@@ -254,26 +252,24 @@ public class DataFusionAggregationExecutor implements BackendAggregationExecutor
 
             logger.info(
                 "[AGG_DELEGATION_TRACE] About to call executeAggregationWithContext: sessionCtxPtr={}, substraitBytes.length={}, providerKey={}, writerGeneration={}",
-                sessionCtxPtr, substraitBytes.length, providerKey, writerGeneration
+                sessionCtxPtr,
+                substraitBytes.length,
+                providerKey,
+                writerGeneration
             );
 
             byte[] arrowIpcBytes = NativeBridge.executeAggregationWithContext(
                 sessionCtxPtr,
                 substraitBytes,
                 providerKey,
-                writerGeneration
+                writerGeneration,
+                contextId
             );
 
-            logger.info(
-                "[AGG_DELEGATION_TRACE] executeAggregationWithContext returned: arrowIpcBytes.length={}",
-                arrowIpcBytes.length
-            );
+            logger.info("[AGG_DELEGATION_TRACE] executeAggregationWithContext returned: arrowIpcBytes.length={}", arrowIpcBytes.length);
 
             // Dump the substrait plan base_schema info for debugging
-            logger.info(
-                "[AGG_DELEGATION_TRACE] Substrait plan first 64 bytes (hex): {}",
-                bytesToHex(substraitBytes, 64)
-            );
+            logger.info("[AGG_DELEGATION_TRACE] Substrait plan first 64 bytes (hex): {}", bytesToHex(substraitBytes, 64));
 
             // Rust consumed the session context — mark it so doClose() won't double-free.
             sessionCtxHandle.markConsumed();
@@ -282,11 +278,7 @@ public class DataFusionAggregationExecutor implements BackendAggregationExecutor
             AggregationBuilder originalAgg = segCtx.originalAgg();
             InternalAggregation result = partialAggregationAdapter.convert(arrowIpcBytes, originalAgg);
 
-            logger.debug(
-                "executeOnSegment completed: segment={}, resultType={}",
-                leaf.ord,
-                result.getClass().getSimpleName()
-            );
+            logger.debug("executeOnSegment completed: segment={}, resultType={}", leaf.ord, result.getClass().getSimpleName());
 
             return result;
         } catch (BackendExecutionException e) {
@@ -508,22 +500,14 @@ public class DataFusionAggregationExecutor implements BackendAggregationExecutor
             // fields by index (via AggregateCall.argList), not by expression, so the
             // dummy input just needs the right row type. The rewire in
             // attachPartialAggOnTop replaces this with the actual scan.
-            org.apache.calcite.rel.RelNode dummyInput = org.apache.calcite.rel.logical.LogicalValues.createEmpty(
-                cluster,
-                inputRowType
-            );
+            org.apache.calcite.rel.RelNode dummyInput = org.apache.calcite.rel.logical.LogicalValues.createEmpty(cluster, inputRowType);
 
             // Build the AggregateCall based on the aggregation type
             String aggType = agg.getType();
             String fieldName = extractFieldName(agg);
             int fieldIndex = fieldName != null ? inputRowType.getFieldNames().indexOf(fieldName) : -1;
 
-            org.apache.calcite.rel.core.AggregateCall aggCall = buildCalciteAggCall(
-                aggType,
-                fieldIndex,
-                inputRowType,
-                typeFactory
-            );
+            org.apache.calcite.rel.core.AggregateCall aggCall = buildCalciteAggCall(aggType, fieldIndex, inputRowType, typeFactory);
 
             // Build the LogicalAggregate — no GROUP BY for simple metrics
             java.util.List<org.apache.calcite.rel.core.AggregateCall> aggCalls = java.util.List.of(aggCall);
@@ -577,30 +561,25 @@ public class DataFusionAggregationExecutor implements BackendAggregationExecutor
                 sqlAggFunc = org.apache.calcite.sql.fun.SqlStdOperatorTable.SUM;
                 argList = java.util.List.of(fieldIndex);
                 // SUM return type matches the input field type (Calcite infers this)
-                returnType = typeFactory.createTypeWithNullability(
-                    inputRowType.getFieldList().get(fieldIndex).getType(), true
-                );
+                returnType = typeFactory.createTypeWithNullability(inputRowType.getFieldList().get(fieldIndex).getType(), true);
                 break;
             case "min":
                 sqlAggFunc = org.apache.calcite.sql.fun.SqlStdOperatorTable.MIN;
                 argList = java.util.List.of(fieldIndex);
                 // MIN/MAX return type matches the input field type
-                returnType = typeFactory.createTypeWithNullability(
-                    inputRowType.getFieldList().get(fieldIndex).getType(), true
-                );
+                returnType = typeFactory.createTypeWithNullability(inputRowType.getFieldList().get(fieldIndex).getType(), true);
                 break;
             case "max":
                 sqlAggFunc = org.apache.calcite.sql.fun.SqlStdOperatorTable.MAX;
                 argList = java.util.List.of(fieldIndex);
-                returnType = typeFactory.createTypeWithNullability(
-                    inputRowType.getFieldList().get(fieldIndex).getType(), true
-                );
+                returnType = typeFactory.createTypeWithNullability(inputRowType.getFieldList().get(fieldIndex).getType(), true);
                 break;
             case "avg":
                 sqlAggFunc = org.apache.calcite.sql.fun.SqlStdOperatorTable.AVG;
                 argList = java.util.List.of(fieldIndex);
                 returnType = typeFactory.createTypeWithNullability(
-                    typeFactory.createSqlType(org.apache.calcite.sql.type.SqlTypeName.DOUBLE), true
+                    typeFactory.createSqlType(org.apache.calcite.sql.type.SqlTypeName.DOUBLE),
+                    true
                 );
                 break;
             case "count":
@@ -729,7 +708,8 @@ public class DataFusionAggregationExecutor implements BackendAggregationExecutor
     private class AggBitsetHandle implements org.opensearch.analytics.spi.FilterDelegationHandle {
         private final FixedBitSet matchingDocs;
         private final java.util.concurrent.atomic.AtomicInteger collectorKeyGen = new java.util.concurrent.atomic.AtomicInteger(0);
-        private final java.util.concurrent.ConcurrentHashMap<Integer, FixedBitSet> collectors = new java.util.concurrent.ConcurrentHashMap<>();
+        private final java.util.concurrent.ConcurrentHashMap<Integer, FixedBitSet> collectors =
+            new java.util.concurrent.ConcurrentHashMap<>();
 
         AggBitsetHandle(FixedBitSet matchingDocs) {
             this.matchingDocs = matchingDocs;
@@ -747,8 +727,13 @@ public class DataFusionAggregationExecutor implements BackendAggregationExecutor
             collectors.put(key, matchingDocs);
             logger.info(
                 "[AGG_DELEGATION_TRACE] AggBitsetHandle.createCollector: providerKey={}, writerGen={}, range=[{},{}), bitset.length={}, bitset.cardinality={}, collectorKey={}",
-                providerKey, writerGeneration, minDoc, maxDoc,
-                matchingDocs.length(), matchingDocs.cardinality(), key
+                providerKey,
+                writerGeneration,
+                minDoc,
+                maxDoc,
+                matchingDocs.length(),
+                matchingDocs.cardinality(),
+                key
             );
             return key;
         }
@@ -803,7 +788,12 @@ public class DataFusionAggregationExecutor implements BackendAggregationExecutor
             }
             logger.info(
                 "[AGG_DELEGATION_TRACE] AggBitsetHandle.collectDocs: collectorKey={}, range=[{},{}), wordsWritten={}, firstWord=0x{}, bitsLength={}",
-                collectorKey, minDoc, maxDoc, wordsToWrite, Long.toHexString(firstWord), bits.length
+                collectorKey,
+                minDoc,
+                maxDoc,
+                wordsToWrite,
+                Long.toHexString(firstWord),
+                bits.length
             );
             return wordsToWrite;
         }

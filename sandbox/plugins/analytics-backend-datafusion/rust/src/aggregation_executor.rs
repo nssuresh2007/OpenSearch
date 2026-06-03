@@ -56,6 +56,9 @@ use crate::session_context::SessionContextHandle;
 /// * `substrait_bytes` — Substrait plan bytes encoding `Aggregate(Filter(Scan))`
 /// * `provider_key` — FFM callback key for the bitset provider (registered on Java side)
 /// * `writer_generation` — segment identifier for the bitset provider's collector
+/// * `context_id` — per-query identifier used by Java to route the collector upcalls to the
+///   correct `FilterDelegationHandle` (matches the id under which the Java side registered the
+///   bitset callback and created the session context)
 ///
 /// # Returns
 ///
@@ -65,6 +68,7 @@ pub async unsafe fn execute_aggregation_with_context(
     substrait_bytes: Vec<u8>,
     provider_key: i32,
     writer_generation: i64,
+    context_id: i64,
 ) -> Result<Vec<u8>, DataFusionError> {
     let handle = *Box::from_raw(session_ctx_ptr as *mut SessionContextHandle);
 

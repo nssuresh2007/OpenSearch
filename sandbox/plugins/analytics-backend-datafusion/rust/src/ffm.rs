@@ -1203,6 +1203,7 @@ pub unsafe extern "C" fn df_execute_aggregation_with_context(
     substrait_len: i32,
     provider_key: i32,
     writer_generation: i64,
+    context_id: i64,
     out_ptr: *mut *mut u8,
     out_len: *mut i32,
 ) -> i64 {
@@ -1231,6 +1232,7 @@ pub unsafe extern "C" fn df_execute_aggregation_with_context(
                 substrait_bytes,
                 provider_key,
                 writer_generation,
+                context_id,
             )
             .await
         });
