@@ -13,6 +13,7 @@ import org.apache.lucene.search.IndexSearcher;
 import org.apache.lucene.search.QueryCache;
 import org.apache.lucene.search.QueryCachingPolicy;
 import org.opensearch.common.annotation.ExperimentalApi;
+import org.opensearch.index.engine.exec.SearchableDirectoryReaderProvider;
 
 import java.util.Map;
 import java.util.Objects;
