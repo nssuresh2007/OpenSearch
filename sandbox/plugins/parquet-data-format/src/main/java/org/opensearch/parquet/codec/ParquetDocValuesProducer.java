@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.DocValuesProducer;
 import org.apache.lucene.index.BinaryDocValues;
+import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.DocValuesSkipper;
 import org.apache.lucene.index.DocValuesType;
 import org.apache.lucene.index.FieldInfo;
@@ -29,7 +30,6 @@ import org.opensearch.parquet.codec.cache.BufferPool;
 import org.opensearch.parquet.codec.iter.ParquetBinaryDocValues;
 import org.opensearch.parquet.codec.iter.ParquetNumericDocValues;
 import org.opensearch.parquet.codec.iter.ParquetSortedDocValues;
-import org.opensearch.parquet.codec.iter.ParquetSortedNumericDocValues;
 import org.opensearch.parquet.codec.iter.ParquetSortedSetDocValues;
 
 import java.io.IOException;
@@ -140,8 +140,28 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
         ensureOpen();
         logger.info("[PARQUET_DV_TRACE] getSortedNumeric: field='{}' segment file={}", field.getName(), parquetFile);
         validate(field, DocValuesType.SORTED_NUMERIC);
-        ParquetColumnReader reader = readerFor(field, true);
-        return new ParquetSortedNumericDocValues(reader, maxDoc);
+
+        // TODO(parquet-docvalues-codec): Revisit and replace with Option 1 (page-cached repeated
+        // reads). This is an interim fix. OpenSearch numeric value sources always request the
+        // SORTED_NUMERIC accessor, even for single-valued fields. Routing every such request through
+        // ParquetSortedNumericDocValues forces the uncached slow path (one parquet_read_repeated_at_row
+        // FFM crossing per doc + a per-doc Arrays.sort), which is catastrophically slow on large
+        // segments (e.g. a terms agg on ClickBench's single-valued "Age" over ~21.7M rows pins one
+        // CPU core for minutes per segment). Until the repeated path is itself page-cached, we detect
+        // the common single-valued case and serve it through the L1/L2 page-cached scalar iterator
+        // (ParquetNumericDocValues) wrapped via DocValues.singleton, which amortizes one FFM page
+        // decode across an entire page.
+        //
+        // Limitation: the codec cannot currently detect a column's true Parquet repetition level at
+        // read time (the `repeated` flag is caller-supplied, and every column is physically written as
+        // `optional repeated`). This interim fix therefore ASSUMES numeric fields are single-valued.
+        // That is correct for the overwhelming majority of numeric fields but produces wrong results
+        // for genuinely multi-valued numeric columns (only the first value per row would be seen).
+        // Option 1 must replace this with a real cardinality signal (max repetition level probed at
+        // column open) plus a page-cached repeated decoder so multi-valued columns are both correct
+        // and fast. Tracked in .kiro/specs/parquet-docvalues-codec.
+        ParquetColumnReader reader = readerFor(field, false);
+        return DocValues.singleton(new ParquetNumericDocValues(reader, maxDoc));
     }
 
     @Override
