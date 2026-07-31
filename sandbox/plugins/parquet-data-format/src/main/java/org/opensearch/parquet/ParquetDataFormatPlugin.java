@@ -43,12 +43,12 @@ import org.opensearch.parquet.codec.ParquetDocValuesDirectoryReader;
 import org.opensearch.parquet.engine.ParquetDataFormat;
 import org.opensearch.parquet.engine.ParquetIndexingEngine;
 import org.opensearch.parquet.fields.ArrowSchemaBuilder;
+import org.opensearch.parquet.rest.ParquetLiquidCacheClearRestAction;
 import org.opensearch.parquet.stats.ParquetStatsProvider;
 import org.opensearch.parquet.stats.transport.ParquetNodeStatsActionType;
 import org.opensearch.parquet.stats.transport.ParquetNodeStatsRestAction;
 import org.opensearch.parquet.stats.transport.ParquetNodeStatsTransportAction;
 import org.opensearch.parquet.stats.transport.ParquetStatsActionType;
-import org.opensearch.parquet.rest.ParquetLiquidCacheClearRestAction;
 import org.opensearch.parquet.stats.transport.ParquetStatsRestAction;
 import org.opensearch.parquet.stats.transport.ParquetStatsTransportAction;
 import org.opensearch.parquet.store.ParquetStoreStrategy;
@@ -153,6 +153,14 @@ public class ParquetDataFormatPlugin extends Plugin implements DataFormatPlugin,
                 : environment.tmpDir();
             RustBridge.liquidCacheSetEnabled(true, liquidCacheMaxBytes, liquidCacheDir.toString());
         }
+
+        // Select the DocValues decode path (codec-native vs DataFusion) and track dynamic updates.
+        org.opensearch.parquet.codec.ParquetDocValuesProducer.setDecodePath(ParquetSettings.DOCVALUES_DECODE_PATH.get(this.settings));
+        clusterService.getClusterSettings()
+            .addSettingsUpdateConsumer(
+                ParquetSettings.DOCVALUES_DECODE_PATH,
+                org.opensearch.parquet.codec.ParquetDocValuesProducer::setDecodePath
+            );
 
         // Register virtual pools if allocator is available (arrow-base loaded)
         if (nativeAllocator != null) {

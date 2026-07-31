@@ -1452,6 +1452,76 @@ pub unsafe extern "C" fn parquet_liquid_cache_stats(
     Ok(0)
 }
 
+// ---------------------------------------------------------------------------
+// DataFusion doc-values decode path (parquet.docvalues.decode_path=datafusion)
+// ---------------------------------------------------------------------------
+
+/// Opens a forward-only single-column DataFusion iterator over `file`/`column`, returning a `>= 0`
+/// opaque handle (or a `< 0` error pointer). Backs the reader with DataFusion's Parquet decoder
+/// instead of the hand-written page decoder.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn parquet_df_open_iter(
+    file_ptr: *const u8,
+    file_len: i64,
+    col_ptr: *const u8,
+    col_len: i64,
+) -> i64 {
+    let filename = str_from_raw(file_ptr, file_len)
+        .map_err(|e| format!("parquet_df_open_iter file: {}", e))?;
+    let column = str_from_raw(col_ptr, col_len)
+        .map_err(|e| format!("parquet_df_open_iter column: {}", e))?;
+    crate::df_docvalues::open(filename, column)
+}
+
+/// Closes a DataFusion doc-values iterator handle. Returns 0; a no-op for an unknown handle.
+#[ffm_safe]
+#[no_mangle]
+pub unsafe extern "C" fn parquet_df_close_iter(handle: i64) -> i64 {
+    crate::df_docvalues::close(handle);
+    Ok(RC_OK)
+}
+
+/// Debug-only: number of currently open DataFusion doc-values iterators.
+#[no_mangle]
+pub unsafe extern "C" fn parquet_df_open_iter_count() -> i64 {
+    crate::df_docvalues::open_count()
+}
+
+/// Advances the iterator to the batch containing `row` (seeking to its row group / page) and copies
+/// it into the caller's out-buffers as per-row `i64` words + a packed presence bitset (same layout
+/// as `parquet_decode_page_at_row`).
+///
+/// Returns `RC_OK` after copying, `RC_OVERFLOW` (with `out_first_row`/`out_last_row`/
+/// `out_value_actual_len` populated) if a buffer is too small, `2` (EOF) if the stream ended before
+/// `row`, or a `< 0` error pointer on failure.
+#[ffm_safe]
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn parquet_df_next_batch(
+    handle: i64,
+    row: i64,
+    out_first_row: *mut i64,
+    out_last_row: *mut i64,
+    out_value_buf: *mut u8,
+    out_value_buf_cap: i64,
+    out_value_actual_len: *mut i64,
+    out_presence_bitset: *mut i64,
+    out_presence_bits_cap: i64,
+) -> i64 {
+    crate::df_docvalues::next_batch(
+        handle,
+        row,
+        out_first_row,
+        out_last_row,
+        out_value_buf,
+        out_value_buf_cap,
+        out_value_actual_len,
+        out_presence_bitset,
+        out_presence_bits_cap,
+    )
+}
+
 /// Enables/disables page-decode phase timing (get/decode/put). Java flips this on only while the
 /// `org.opensearch.parquet.timing` logger is at TRACE. When off, the decode path takes no
 /// `Instant::now()` (one relaxed atomic load per page). Returns 0.

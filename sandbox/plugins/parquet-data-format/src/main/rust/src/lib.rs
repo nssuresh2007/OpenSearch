@@ -14,6 +14,8 @@ mod tests;
 
 pub mod writer;
 pub mod ffm;
+pub mod df_docvalues;
+pub mod df_row_selection;
 pub mod liquid_page_cache;
 pub mod memory;
 pub mod native_settings;

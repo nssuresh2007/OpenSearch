@@ -8,6 +8,8 @@
 
 package org.opensearch.parquet.codec;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.DocValuesProducer;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DocValuesSkipper;
@@ -20,11 +22,14 @@ import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.opensearch.index.mapper.MappedFieldType;
 import org.opensearch.index.mapper.MapperService;
+import org.opensearch.parquet.ParquetSettings;
+import org.opensearch.parquet.bridge.DataFusionColumnReader;
 import org.opensearch.parquet.bridge.ParquetColumnReader;
 import org.opensearch.parquet.bridge.ParquetFileMetadata;
 import org.opensearch.parquet.bridge.RustBridge;
 import org.opensearch.parquet.codec.cache.BufferPool;
 import org.opensearch.parquet.codec.cache.QueryParquetStats;
+import org.opensearch.parquet.codec.iter.DataFusionNumericDocValues;
 import org.opensearch.parquet.codec.iter.ParquetBinaryDocValues;
 import org.opensearch.parquet.codec.iter.ParquetNumericDocValues;
 import org.opensearch.parquet.codec.iter.ParquetSortedDocValues;
@@ -60,6 +65,20 @@ import java.util.Map;
  */
 public final class ParquetDocValuesProducer extends DocValuesProducer {
 
+    private static final Logger logger = LogManager.getLogger(ParquetDocValuesProducer.class);
+
+    /**
+     * Node-wide selected decode path (see {@link ParquetSettings#DOCVALUES_DECODE_PATH}). Volatile
+     * so the dynamic-setting update consumer in the plugin is visible to query threads. Defaults to
+     * the codec-native path.
+     */
+    private static volatile boolean useDataFusionDecodePath = false;
+
+    /** Updates the node-wide decode path. Called by the plugin at init and on dynamic updates. */
+    public static void setDecodePath(String decodePath) {
+        useDataFusionDecodePath = ParquetSettings.DECODE_PATH_DATAFUSION.equals(decodePath);
+    }
+
     private final Path parquetFile;
     private final MapperService mapperService;
     private final int maxDoc;
@@ -67,6 +86,7 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
 
     private final BufferPool bufferPool = new BufferPool();
     private final Map<String, ParquetColumnReader> columnReaders = new HashMap<>();
+    private final Map<String, DataFusionColumnReader> dfColumnReaders = new HashMap<>();
     private final Map<String, OrdinalTable> ordinalTables = new HashMap<>();
 
     /** Optional per-query accumulator; propagated to each column reader so its stats roll up at close. */
@@ -136,8 +156,47 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
     public NumericDocValues getNumeric(FieldInfo field) throws IOException {
         ensureOpen();
         validate(field, DocValuesType.NUMERIC);
+        if (useDataFusionDecodePath && isDataFusionSupported(field)) {
+            DataFusionNumericDocValues dv = tryDataFusionNumeric(field);
+            if (dv != null) {
+                return dv;
+            }
+            // else fall through to the codec-native path (Requirement 6.3).
+        }
         ParquetColumnReader reader = readerFor(field, false);
         return new ParquetNumericDocValues(reader, maxDoc);
+    }
+
+    /**
+     * The DataFusion path handles single-valued primitive numeric columns (everything the codec
+     * supports except {@code BYTE_ARRAY}/keyword, which is served natively for now).
+     */
+    private boolean isDataFusionSupported(FieldInfo field) {
+        return physicalType(field) != ParquetPhysicalType.BYTE_ARRAY;
+    }
+
+    /**
+     * Builds a DataFusion-backed numeric iterator, or returns {@code null} if the stream cannot be
+     * opened — the caller then falls back to the codec-native path so the query never fails on a
+     * DataFusion-path initialization error.
+     */
+    private DataFusionNumericDocValues tryDataFusionNumeric(FieldInfo field) {
+        try {
+            DataFusionColumnReader reader = dfReaderFor(field);
+            return new DataFusionNumericDocValues(reader, maxDoc);
+        } catch (IOException | RuntimeException e) {
+            logger.warn("DataFusion decode path unavailable for field '{}'; falling back to codec-native", field.getName(), e);
+            return null;
+        }
+    }
+
+    private DataFusionColumnReader dfReaderFor(FieldInfo field) throws IOException {
+        DataFusionColumnReader reader = dfColumnReaders.get(field.getName());
+        if (reader == null) {
+            reader = DataFusionColumnReader.open(parquetFile, field.getName(), bufferPool);
+            dfColumnReaders.put(field.getName(), reader);
+        }
+        return reader;
     }
 
     @Override
@@ -236,7 +295,18 @@ public final class ParquetDocValuesProducer extends DocValuesProducer {
                 // Suppress per-reader errors so every reader gets a chance to close.
             }
         }
+        for (DataFusionColumnReader reader : dfColumnReaders.values()) {
+            try {
+                reader.close();
+            } catch (IOException | RuntimeException e) {
+                if (first == null && e instanceof IOException io) {
+                    first = io;
+                }
+                // Suppress per-reader errors so every reader gets a chance to close.
+            }
+        }
         columnReaders.clear();
+        dfColumnReaders.clear();
         ordinalTables.clear();
         bufferPool.close();
         if (first != null) {

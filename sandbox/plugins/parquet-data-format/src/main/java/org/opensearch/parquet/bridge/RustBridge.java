@@ -66,6 +66,12 @@ public class RustBridge {
     private static final MethodHandle GET_COLUMN_PAGE_INDEX;
     private static final MethodHandle DECODE_PAGE_AT_ROW;
 
+    // DataFusion doc-values decode path (parquet.docvalues.decode_path=datafusion)
+    private static final MethodHandle DF_OPEN_ITER;
+    private static final MethodHandle DF_CLOSE_ITER;
+    private static final MethodHandle DF_OPEN_ITER_COUNT;
+    private static final MethodHandle DF_NEXT_BATCH;
+
     /**
      * Positive status code returned by the column-reader read/decode functions
      * when a caller out-buffer was too small. The required sizes are written to
@@ -418,6 +424,39 @@ public class RustBridge {
                 ValueLayout.ADDRESS,    // out_value_actual_len
                 ValueLayout.ADDRESS,    // out_byte_offsets
                 ValueLayout.JAVA_LONG,  // out_byte_offsets_cap
+                ValueLayout.ADDRESS,    // out_presence_bitset
+                ValueLayout.JAVA_LONG   // out_presence_bits_cap
+            )
+        );
+        DF_OPEN_ITER = linker.downcallHandle(
+            lib.find("parquet_df_open_iter").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.ADDRESS,    // file_ptr
+                ValueLayout.JAVA_LONG,  // file_len
+                ValueLayout.ADDRESS,    // col_ptr
+                ValueLayout.JAVA_LONG   // col_len
+            )
+        );
+        DF_CLOSE_ITER = linker.downcallHandle(
+            lib.find("parquet_df_close_iter").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG)
+        );
+        DF_OPEN_ITER_COUNT = linker.downcallHandle(
+            lib.find("parquet_df_open_iter_count").orElseThrow(),
+            FunctionDescriptor.of(ValueLayout.JAVA_LONG)
+        );
+        DF_NEXT_BATCH = linker.downcallHandle(
+            lib.find("parquet_df_next_batch").orElseThrow(),
+            FunctionDescriptor.of(
+                ValueLayout.JAVA_LONG,
+                ValueLayout.JAVA_LONG,  // handle
+                ValueLayout.JAVA_LONG,  // row
+                ValueLayout.ADDRESS,    // out_first_row
+                ValueLayout.ADDRESS,    // out_last_row
+                ValueLayout.ADDRESS,    // out_value_buf
+                ValueLayout.JAVA_LONG,  // out_value_buf_cap
+                ValueLayout.ADDRESS,    // out_value_actual_len
                 ValueLayout.ADDRESS,    // out_presence_bitset
                 ValueLayout.JAVA_LONG   // out_presence_bits_cap
             )
@@ -922,7 +961,8 @@ public class RustBridge {
      * @param misses liquid {@code get} found nothing, so the caller decoded from Parquet
      * @param puts   decoded pages inserted into liquid
      */
-    public record LiquidCacheStats(long hits, long misses, long puts) {}
+    public record LiquidCacheStats(long hits, long misses, long puts) {
+    }
 
     /**
      * Snapshots the codec liquid cache event counters. Cheap (three relaxed atomic loads on the
@@ -944,7 +984,8 @@ public class RustBridge {
     }
 
     /** Cumulative page-decode phase timers (nanos since process start): get/decode/put. */
-    public record TimingStats(long getNanos, long decodeNanos, long putNanos) {}
+    public record TimingStats(long getNanos, long decodeNanos, long putNanos) {
+    }
 
     /** Enables/disables native page-decode phase timing. Called when the timing logger toggles. */
     public static void timingSetEnabled(boolean enabled) {
@@ -958,11 +999,7 @@ public class RustBridge {
             var d = call.longOut();
             var p = call.longOut();
             call.invoke(TIMING_SNAPSHOT, g, d, p);
-            return new TimingStats(
-                g.get(ValueLayout.JAVA_LONG, 0),
-                d.get(ValueLayout.JAVA_LONG, 0),
-                p.get(ValueLayout.JAVA_LONG, 0)
-            );
+            return new TimingStats(g.get(ValueLayout.JAVA_LONG, 0), d.get(ValueLayout.JAVA_LONG, 0), p.get(ValueLayout.JAVA_LONG, 0));
         }
     }
 
@@ -1069,6 +1106,69 @@ public class RustBridge {
             outValueActualLen,
             outByteOffsets,
             outByteOffsetsCap,
+            outPresenceBitset,
+            outPresenceBitsCap
+        );
+    }
+
+    // ── DataFusion doc-values decode path ──
+
+    /**
+     * Status returned by {@link #dfNextBatch} when the DataFusion stream was exhausted before a
+     * batch covering the requested row was found. For a well-formed {@code row == docId} segment
+     * with {@code row < numRows} this should not occur.
+     */
+    public static final long RC_EOF = 2L;
+
+    /**
+     * Opens a forward-only single-column DataFusion stream over {@code file}/{@code column},
+     * returning a {@code >= 0} opaque handle. The handle is released via {@link #dfCloseIter}.
+     */
+    public static long dfOpenIter(String file, String column) throws IOException {
+        try (var call = new NativeCall()) {
+            var f = call.str(file);
+            var c = call.str(column);
+            return call.invokeIO(DF_OPEN_ITER, f.segment(), f.len(), c.segment(), c.len());
+        }
+    }
+
+    /** Closes a DataFusion doc-values iterator handle. A no-op for an unknown handle. */
+    public static void dfCloseIter(long handle) throws IOException {
+        invokeChecked(DF_CLOSE_ITER, handle);
+    }
+
+    /** Debug-only: number of currently open DataFusion doc-values iterators (handle non-leakage). */
+    public static long dfOpenIterCount() {
+        return NativeCall.invokeStatic(DF_OPEN_ITER_COUNT);
+    }
+
+    /**
+     * Advances the iterator to the batch containing {@code row} and copies it into the caller
+     * out-segments as per-row {@code i64} words + a packed presence bitset. Returns {@code 0} on
+     * success, {@link #RC_OVERFLOW} when a buffer was too small (range + required value byte length
+     * are written so the caller can size buffers and retry once), or {@link #RC_EOF} at end of
+     * stream.
+     */
+    static long dfNextBatch(
+        long handle,
+        long row,
+        MemorySegment outFirstRow,
+        MemorySegment outLastRow,
+        MemorySegment outValueBuf,
+        long outValueBufCap,
+        MemorySegment outValueActualLen,
+        MemorySegment outPresenceBitset,
+        long outPresenceBitsCap
+    ) throws IOException {
+        return invokeChecked(
+            DF_NEXT_BATCH,
+            handle,
+            row,
+            outFirstRow,
+            outLastRow,
+            outValueBuf,
+            outValueBufCap,
+            outValueActualLen,
             outPresenceBitset,
             outPresenceBitsCap
         );

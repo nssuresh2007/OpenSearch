@@ -238,6 +238,41 @@ public final class ParquetSettings {
         Setting.Property.NodeScope
     );
 
+    /** Decode-path value: the current hand-written Rust page decoder + Java {@code PageCache}. */
+    public static final String DECODE_PATH_CODEC_NATIVE = "codec_native";
+    /** Decode-path value: doc-values reads served from DataFusion-decoded Arrow batches. */
+    public static final String DECODE_PATH_DATAFUSION = "datafusion";
+
+    /** Valid values for {@link #DOCVALUES_DECODE_PATH}. */
+    public static final Set<String> VALID_DECODE_PATHS = Set.of(DECODE_PATH_CODEC_NATIVE, DECODE_PATH_DATAFUSION);
+
+    /**
+     * Selects how the Parquet DocValues codec decodes column values for reads:
+     * <ul>
+     *   <li>{@code codec_native} (default) — the hand-written Rust page decoder
+     *       ({@code parquet_decode_page_at_row}) serving reads from the Java {@code PageCache};</li>
+     *   <li>{@code datafusion} — reads served from Arrow batches produced by DataFusion's Parquet
+     *       reader, decoded once per batch and cached (shared liquid cache when enabled).</li>
+     * </ul>
+     * Node-scoped and dynamic so the path can be switched at runtime for benchmarking or rollback.
+     * On DataFusion-path init failure the reader falls back to {@code codec_native} per query.
+     */
+    public static final Setting<String> DOCVALUES_DECODE_PATH = new Setting<>(
+        "parquet.docvalues.decode_path",
+        DECODE_PATH_CODEC_NATIVE,
+        ParquetSettings::validateDecodePath,
+        Setting.Property.NodeScope,
+        Setting.Property.Dynamic
+    );
+
+    private static String validateDecodePath(String value) {
+        String normalized = value.toLowerCase(Locale.ROOT);
+        if (VALID_DECODE_PATHS.contains(normalized) == false) {
+            throw new IllegalArgumentException("Invalid parquet.docvalues.decode_path: " + value + ". Valid values: " + VALID_DECODE_PATHS);
+        }
+        return normalized;
+    }
+
     /**
      * Minimum number of variable-width (string/binary) non-sort columns required to activate
      * deferred data loading during merge. Below this threshold, all columns are decoded eagerly
@@ -872,6 +907,7 @@ public final class ParquetSettings {
             MERGE_IO_THREADS,
             LIQUID_CACHE_ENABLED,
             LIQUID_CACHE_MAX_BYTES,
+            DOCVALUES_DECODE_PATH,
             MERGE_DEFERRED_COLUMN_THRESHOLD,
             WRITE_POOL_MIN,
             WRITE_POOL_MAX,
