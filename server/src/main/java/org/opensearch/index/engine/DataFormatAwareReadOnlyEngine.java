@@ -315,11 +315,8 @@ public class DataFormatAwareReadOnlyEngine implements Indexer {
     }
 
     /**
-     * Builds a point-in-time searcher supplier so {@code _search} reaches a shard tiered to warm, with
-     * each segment bound to the Parquet file backing its doc values. Identical to
-     * {@link DataFormatAwareEngine#acquireSearcherSupplier}, because a warm shard must bind the same way
-     * a hot one does; the difference is that its Parquet files live in the remote object store, which the
-     * shared binding records on each segment.
+     * Builds a point-in-time searcher supplier over the current reader. Delegates to
+     * {@link DataFormatAwareSearcherSupport} so hot and warm shards behave identically.
      *
      * <p>The supplier closing {@link #acquireReader()}'s reference is harmless here: this engine's
      * reference carries a no-op close over a reader pinned for the engine's lifetime.
@@ -333,7 +330,7 @@ public class DataFormatAwareReadOnlyEngine implements Indexer {
         } catch (IOException e) {
             throw new EngineException(shardId, "failed to acquire reader for searcher", e);
         }
-        return DataFormatAwareSearcherSupport.acquireSearcherSupplier(shardId, engineConfig, store, readerRef, wrapper, logger);
+        return DataFormatAwareSearcherSupport.acquireSearcherSupplier(shardId, engineConfig, readerRef, wrapper, logger);
     }
 
     // ---- IndexerEngineOperations (Task 3 — write rejection) ----
